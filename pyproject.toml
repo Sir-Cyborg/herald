@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herald"
+dynamic = ["version"]
+description = "Voice-cloning text-to-speech (XTTS-v2) with fine-tuning and a local LLM chat loop"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    # The XTTS stack. torch and torchaudio must match each other; torchaudio 2.8 still
+    # loads audio without torchcodec/ffmpeg, which newer releases require.
+    "coqui-tts==0.27.5",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "transformers==4.57.6",
+    "numpy==2.4.6",
+    "requests==2.34.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-mock==3.16.0",
+    "ruff==0.16.9",
+]
+
+[project.scripts]
+herald = "herald.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "herald.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: needs the XTTS checkpoints and runs a real model (deselect with -m 'not integration')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+# The POC notebook predates the package; it is not part of herald.
+extend-exclude = ["*.ipynb", "POC"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

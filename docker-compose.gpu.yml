@@ -1,0 +1,32 @@
+# Override for hosts with an NVIDIA GPU and the NVIDIA Container Toolkit (Linux; see the header
+# of docker/Dockerfile.gpu). Not for macOS: Docker Desktop cannot pass a GPU through there.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm herald train
+#
+# To drop the -f flags, set COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml in .env
+# (see .env.example).
+#
+# herald uses the CUDA build of the image (also for training); Ollama gets the GPU too.
+
+services:
+  herald:
+    build:
+      dockerfile: docker/Dockerfile.gpu
+    image: herald:gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

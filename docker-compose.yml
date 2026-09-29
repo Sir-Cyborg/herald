@@ -1,0 +1,75 @@
+# Ollama (local LLM) plus the herald CLI.
+#
+#   cp .env.example .env                          # optional: settings, see the file
+#   mkdir -p dataset models runs output           # otherwise Docker creates them owned by root
+#   docker compose build
+#   docker compose run --rm herald download-checkpoints
+#   docker compose run --rm herald synthesize "Hello." -o output/hello.wav
+#
+# `chat` needs an Ollama, which herald does not start on its own (the other commands do not
+# need one). Either the container, or one running on the host (HERALD_OLLAMA_URL, see .env.example):
+#
+#   docker compose up -d --wait ollama
+#   docker compose exec ollama ollama pull llama3.2:3b
+#   docker compose run --rm herald chat --no-play
+#
+# NVIDIA GPU on Linux: add `-f docker-compose.gpu.yml` (see README).
+
+name: herald
+
+services:
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    # Healthy once the server answers, so `up --wait` (and later `depends_on`) can wait for it.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # Other services of this project already reach it at http://ollama:11434. Not published on
+    # the host on purpose: a native Ollama usually owns port 11434 already.
+    # To reach it from the host or the LAN (e.g. an ESP32) add `ports: ["11434:11434"]` (no auth!).
+
+  herald:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        UID: ${HERALD_UID:-1000}
+        GID: ${HERALD_GID:-1000}
+    image: herald:cpu
+    # No depends_on on purpose: only `chat` talks to Ollama, and it must not be started (and
+    # its image pulled) for synthesize, train or download-checkpoints.
+    init: true # reaps children and lets `docker stop` end herald at once
+    shm_size: 2gb # PyTorch data loader workers pass batches through /dev/shm (Docker's default: 64 MB)
+    environment:
+      # Set in .env (see .env.example). An empty value counts as unset in herald. The path
+      # variables (HERALD_PROJECT_ROOT, _MODELS_DIR, _CHECKPOINT_DIR, _RUNS_DIR, _OUTPUT_DIR) are
+      # not forwarded: the mounts below fix those locations.
+      HERALD_OLLAMA_URL: ${HERALD_OLLAMA_URL:-http://ollama:11434}
+      HERALD_OLLAMA_MODEL: ${HERALD_OLLAMA_MODEL:-}
+      HERALD_OLLAMA_TIMEOUT: ${HERALD_OLLAMA_TIMEOUT:-}
+      HERALD_SYSTEM_PROMPT: ${HERALD_SYSTEM_PROMPT:-}
+      HERALD_CHECKPOINT: ${HERALD_CHECKPOINT:-}
+      HERALD_DATASET_DIR: ${HERALD_DATASET_DIR:-}
+      HERALD_LANGUAGE: ${HERALD_LANGUAGE:-}
+      HERALD_DEVICE: ${HERALD_DEVICE:-}
+      HERALD_CHECKPOINT_URL: ${HERALD_CHECKPOINT_URL:-}
+    extra_hosts:
+      # Lets HERALD_OLLAMA_URL=http://host.docker.internal:11434 work on Linux too.
+      - host.docker.internal:host-gateway
+    volumes:
+      # Big files stay on the host and never enter the image.
+      - ./dataset:/app/dataset
+      - ./models:/app/models
+      - ./runs:/app/runs
+      - ./output:/app/output
+    stdin_open: true # `chat` reads from the terminal
+    tty: true
+    # A herald server would publish its port here: `ports: ["8000:8000"]`.
+
+volumes:
+  ollama:

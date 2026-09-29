@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The unit tests replace everything heavy with fakes, so torch and coqui-tts (several GB)
+      # are not installed. Only what the tests import is: the pins come from pyproject.toml.
+      - name: Install herald without its heavy dependencies
+        run: |
+          pip install --no-deps -e .
+          python - <<'EOF' > ci-requirements.txt
+          import tomllib
+
+          project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+          light = [d for d in project["dependencies"] if d.split("==")[0] in ("requests", "numpy")]
+          print("\n".join(light + project["optional-dependencies"]["dev"]))
+          EOF
+          pip install -r ci-requirements.txt
+
+      - name: Lint
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Unit tests
+        run: pytest -m "not integration"
+
+      # Cheap check that both Compose files (and their merge) are valid; nothing is built.
+      - name: Validate the Compose files
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q

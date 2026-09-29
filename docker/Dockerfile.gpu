@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1
+#
+# NVIDIA GPU image, for training as well as inference. It needs a host with an NVIDIA driver
+# (570 or newer for CUDA 12.8) and the NVIDIA Container Toolkit, i.e. Linux; Docker Desktop on
+# Windows with the WSL2 backend can pass a GPU through as well. It is linux/amd64 only (that
+# is what the base image offers) and not available for macOS: Docker Desktop has no GPU
+# passthrough there.
+#
+# Needs BuildKit (the default since Docker 23 and in Docker Desktop).
+# Build and run from the repository root through docker-compose.gpu.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
+# (or: docker build -f docker/Dockerfile.gpu -t herald:gpu .; then `docker run --gpus all ...`).
+
+# Ships Python 3.11 (conda), CUDA 12.8 and torch/torchaudio 2.8.0, matching the pins in
+# pyproject.toml, so pip below finds them already installed and downloads no CUDA build.
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    HERALD_PROJECT_ROOT=/app
+
+# libsndfile: audio I/O for soundfile/librosa. libgomp: OpenMP runtime that torchaudio loads.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# The dependencies come from pyproject.toml alone, so this heavy layer is rebuilt only when
+# pyproject.toml changes, not on every source edit.
+# monotonic-alignment-search may compile from source, so a C compiler is installed for this
+# step only and removed again.
+COPY pyproject.toml ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && pip install -r /tmp/requirements.txt \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
+
+# Herald itself: pure Python, so this step is quick.
+COPY README.md LICENSE ./
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps .
+
+# Build-time smoke test: the entry point and the native libraries load, and torch is still the
+# CUDA build that came with the base image (there is no GPU while building, but the build
+# itself reports its CUDA version).
+RUN herald --help > /dev/null \
+    && python -c "import torch, torchaudio, TTS, trainer; assert torch.version.cuda, 'torch has no CUDA support'"
+
+# Run as a regular user so files written to the bind mounts are not owned by root.
+# On Linux match your host user (see .env.example): HERALD_UID/HERALD_GID, then rebuild.
+# --non-unique: a host GID such as 20 already exists in the image.
+ARG UID=1000
+ARG GID=1000
+RUN groupadd --non-unique --gid "$GID" herald \
+    && useradd --non-unique --uid "$UID" --gid herald --create-home herald \
+    && mkdir -p dataset models runs output \
+    && chown herald:herald . dataset models runs output
+USER herald
+
+# dataset/, models/, runs/ and output/ are bind-mounted (see docker-compose.yml).
+ENTRYPOINT ["herald"]
+CMD ["--help"]

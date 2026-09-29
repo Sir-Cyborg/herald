@@ -1,0 +1,34 @@
+# The images only need pyproject.toml, README.md, LICENSE and src/. Everything else stays out
+# of the build context; the big data stays on the host and is bind-mounted at run time
+# (see docker-compose.yml).
+dataset/
+models/
+runs/
+output/
+**/*.pth
+**/*.wav
+
+# Local configuration
+.env
+.env.*
+
+# Not needed to build the image
+.git/
+.github/
+.claude/
+tests/
+docker/
+docker-compose*.yml
+POC/
+**/*.ipynb
+
+# Local environments and caches
+.venv/
+venv/
+build/
+dist/
+**/__pycache__/
+**/*.egg-info/
+.pytest_cache/
+.ruff_cache/
+**/.DS_Store

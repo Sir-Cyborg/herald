@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data and artifacts that never belong in git: the dataset, model weights (the base model and
+# the fine-tuned voices), training runs and generated audio. Docker bind-mounts these
+# directories, too.
+/dataset/
+/models/
+/runs/
+/output/
+*.pth
+
+# The original proof-of-concept notebook and its samples
+/POC/
+
+# Local configuration (.env.example is the template that stays in git)
+.env
+.env.*
+!.env.example
+.claude/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
