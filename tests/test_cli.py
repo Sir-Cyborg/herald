@@ -1,11 +1,13 @@
 """CLI: --help for every command, argument wiring with the heavy modules replaced by fakes."""
 
+import contextlib
 import io
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +17,39 @@ import pytest
 import requests
 
 from herald import cli
-from herald.config import DEFAULT_CHECKPOINT_URL, DEFAULT_OLLAMA_TIMEOUT
+from herald.config import DEFAULT_CHECKPOINT_URL, DEFAULT_OLLAMA_TIMEOUT, Settings
 from herald.errors import CheckpointError, HeraldError, OllamaError
+from herald.tools import LoadReport, ToolContext, ToolRegistry
+from herald.tools.scheduler import Scheduler
 from herald.tts.slim import SlimResult
 from herald.tts.train import TrainResult
 
-COMMANDS = ["synthesize", "train", "slim", "chat", "download-checkpoints"]
+SHOUT_TOOL = """\
+from herald.tools import tool
+
+
+@tool
+def shout(text: str, times: int = 1) -> str:
+    \"\"\"Repeat the text in capitals.
+
+    Args:
+        text: What to shout.
+        times: How often (once if not said).
+    \"\"\"
+    return " ".join([text.upper()] * times)
+"""
+
+WHISPER_TOOL = """\
+from herald.tools import tool
+
+
+@tool(triggers=["whisper", "quiet"])
+def whisper(text: str) -> str:
+    \"\"\"Repeat the text in lower case.\"\"\"
+    return text.lower()
+"""
+
+COMMANDS = ["synthesize", "train", "slim", "chat", "tools", "download-checkpoints"]
 
 
 @pytest.fixture(autouse=True)
@@ -1092,6 +1121,356 @@ class TestChat:
         sent = [call.kwargs["json"]["messages"] for call in post.call_args_list]
         assert [m["content"] for m in sent[2]][1:] == ["one", "First.", "three"]  # no "two"
 
+    # --- tools ----------------------------------------------------------------------------------
+
+    @pytest.fixture
+    def load_calls(self, monkeypatch):
+        """Spy on load_tools: records (tools_dir, context) and runs the real thing."""
+        import herald.tools
+
+        calls = []
+        real = herald.tools.load_tools
+
+        def load_tools(user_dir, context, **kwargs):
+            calls.append((user_dir, context))
+            return real(user_dir, context, **kwargs)
+
+        monkeypatch.setattr(herald.tools, "load_tools", load_tools)
+        return calls
+
+    def tool_names(self, registry):
+        return [schema["function"]["name"] for schema in registry.schemas()]
+
+    def test_the_tools_are_offered_to_the_assistant(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, capsys
+    ):
+        typed()
+        code, out, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 0
+        ((user_dir, context),) = load_calls
+        assert user_dir == tmp_path / "project" / "tools"  # the default tools directory
+        assert isinstance(context, ToolContext) and isinstance(context.scheduler, Scheduler)
+        assert self.tool_names(assistant.created[0]["tools"]) == ["set_timer"]
+        assert "Tools: set_timer\n" in out
+
+    def test_tools_dir_option_and_environment(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, monkeypatch, capsys
+    ):
+        typed()
+        monkeypatch.setenv("HERALD_TOOLS_DIR", str(tmp_path / "from_env"))
+        run(self.chat_args(dataset_dir, tmp_path), capsys)
+        run(self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tmp_path / "mine")), capsys)
+        assert [d for d, _ in load_calls] == [tmp_path / "from_env", tmp_path / "mine"]
+
+    def test_your_own_tool_scripts_are_loaded(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
+    ):
+        tools_dir = tmp_path / "mine"
+        tools_dir.mkdir()
+        (tools_dir / "shout.py").write_text(SHOUT_TOOL, encoding="utf-8")
+        typed()
+        _, out, _ = run(
+            self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tools_dir)), capsys
+        )
+        assert "Tools: set_timer, shout\n" in out
+        assert self.tool_names(assistant.created[0]["tools"]) == ["set_timer", "shout"]
+
+    def test_no_tools(self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, capsys):
+        typed("a")
+        code, out, _ = run(self.chat_args(dataset_dir, tmp_path, "--no-tools"), capsys)
+        assert code == 0
+        assert load_calls == []
+        assert assistant.created[0]["tools"] is None
+        assert "Tools:" not in out
+        assert "Herald: First reply." in out  # a plain chat
+
+    @pytest.mark.parametrize(
+        ("extra", "use_triggers"),
+        [
+            ([], True),  # a tool with trigger words is only offered when one of them is said
+            (["--always-offer-tools"], False),
+            (["--no-tools", "--always-offer-tools"], False),  # harmless without tools
+        ],
+    )
+    def test_always_offer_tools(
+        self, extra, use_triggers, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
+    ):
+        typed()
+        code, _, _ = run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
+        assert code == 0
+        assert assistant.created[0]["use_triggers"] is use_triggers
+
+    def test_no_tools_found_means_no_registry_and_no_line(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, monkeypatch, capsys
+    ):
+        import herald.tools
+
+        nothing = LoadReport(ToolRegistry(), (), ())
+        monkeypatch.setattr(herald.tools, "load_tools", lambda user_dir, context, **kw: nothing)
+        typed()
+        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 0
+        assert assistant.created[0]["tools"] is None
+        assert "Tools:" not in out and "warning" not in err
+
+    def test_a_broken_tool_script_is_a_warning_not_the_end_of_the_chat(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
+    ):
+        tools_dir = tmp_path / "mine"
+        tools_dir.mkdir()
+        (tools_dir / "broken.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+        (tools_dir / "shout.py").write_text(SHOUT_TOOL, encoding="utf-8")
+        typed("a")
+        code, out, err = run(
+            self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tools_dir)), capsys
+        )
+        assert code == 0
+        assert err.count("warning: tools: ") == 1 and "boom" in err
+        assert "Tools: set_timer, shout\n" in out  # the good ones still load
+        assert "Herald: First reply." in out
+
+    @pytest.fixture
+    def scheduler(self, monkeypatch, scratch_root):
+        """A Scheduler that records its shutdown instead of running timers."""
+        import herald.tools.scheduler
+
+        seen = SimpleNamespace(shutdowns=0, pending=0, scratch_when_stopped=None)
+
+        class FakeScheduler:
+            def shutdown(self):
+                seen.shutdowns += 1
+                seen.scratch_when_stopped = any(scratch_root.iterdir())
+                return seen.pending
+
+        monkeypatch.setattr(herald.tools.scheduler, "Scheduler", FakeScheduler)
+        return seen
+
+    def test_timers_are_cancelled_when_the_chat_ends(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
+    ):
+        scheduler.pending = 2
+        typed("a", "")
+        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 0
+        assert scheduler.shutdowns == 1
+        assert (
+            "2 timer(s) were still running and have been cancelled because the chat ended." in err
+        )
+        # The timers go first: none can fire into the scratch directory once it is removed.
+        assert scheduler.scratch_when_stopped is True
+
+    def test_no_message_when_no_timer_was_running(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
+    ):
+        typed()
+        _, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert scheduler.shutdowns == 1
+        assert "timer(s)" not in err
+
+    def test_timers_are_cancelled_on_ctrl_c_too(
+        self, dataset_dir, tmp_path, fake_load, assistant, scheduler, monkeypatch, capsys
+    ):
+        scheduler.pending = 1
+
+        def interrupted(prompt=""):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("builtins.input", interrupted)
+        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 130
+        assert scheduler.shutdowns == 1
+        assert "1 timer(s) were still running" in err
+
+    def test_no_scheduler_without_tools(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
+    ):
+        typed()
+        run(self.chat_args(dataset_dir, tmp_path, "--no-tools"), capsys)
+        assert scheduler.shutdowns == 0
+
+    # --- alerts (what a timer says) ------------------------------------------------------------
+
+    def chat_voice(self, dataset_dir, tmp_path, stack, *extra):
+        """The speaker and the announcer of a chat, built like ``herald chat`` builds them."""
+        settings = Settings.from_env()
+        argv = ["chat", *voice_args(dataset_dir, tmp_path), *extra]
+        args = cli.build_parser(settings).parse_args(argv)
+        speak = cli._make_speaker(args, settings, stack)
+        return speak, cli._make_announcer(speak)
+
+    def test_an_alert_is_printed_and_spoken_once(
+        self, dataset_dir, tmp_path, fake_load, mocker, capsys
+    ):
+        play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
+        with contextlib.ExitStack() as stack:
+            _, announce = self.chat_voice(dataset_dir, tmp_path, stack)
+            announce("Your tea is ready.")
+        out = capsys.readouterr().out
+        assert out == "\a\n[Herald] Your tea is ready.\n"  # with a terminal bell
+        assert [c["text"] for c in fake_load.calls] == ["Your tea is ready."]
+        assert play.call_count == 1
+
+    def test_a_text_only_chat_prints_the_alert_and_does_not_speak(
+        self, dataset_dir, tmp_path, fake_load, mocker, capsys
+    ):
+        play = mocker.patch("herald.audio_playback.play_wav")
+        with contextlib.ExitStack() as stack:
+            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack, "--no-play")
+            assert speak is None
+            announce("Your tea is ready.")
+        assert "[Herald] Your tea is ready." in capsys.readouterr().out
+        assert fake_load.load_calls == [] and fake_load.calls == []
+        play.assert_not_called()
+
+    def test_a_failed_alert_is_reported_and_never_raises(
+        self, dataset_dir, tmp_path, fake_load, capsys
+    ):
+        def broken(text, pause_ms, max_chars):
+            raise RuntimeError("model exploded")
+
+        fake_load.synth_long = broken
+        with contextlib.ExitStack() as stack:
+            _, announce = self.chat_voice(dataset_dir, tmp_path, stack)
+            announce("Your tea is ready.")  # must not raise: it runs on a timer thread
+        captured = capsys.readouterr()
+        assert "[Herald] Your tea is ready." in captured.out  # the text still gets through
+        assert "error: could not speak the reply: model exploded" in captured.err
+
+    def test_alerts_are_saved_next_to_the_replies(self, dataset_dir, tmp_path, fake_load, capsys):
+        with contextlib.ExitStack() as stack:
+            speak, announce = self.chat_voice(
+                dataset_dir, tmp_path, stack, *self.keep(tmp_path), "--no-play"
+            )
+            announce("First alert.")
+            speak("A reply.", "chat", 1)
+            announce("Second alert.")
+        names = sorted(p.name for p in (tmp_path / "wavs").iterdir())
+        assert [n.split("_")[0] + n[-8:] for n in names] == [
+            "alert_001.wav",
+            "alert_002.wav",
+            "chat_001.wav",
+        ]
+
+    def test_replies_and_alerts_never_overlap(self, dataset_dir, tmp_path, fake_load, capsys):
+        """Two alerts (timer threads) and a reply (main thread) all want the voice at once."""
+        guard = threading.Lock()
+        state = SimpleNamespace(active=0, peak=0, calls=0)
+        first_in, second_in, release = threading.Event(), threading.Event(), threading.Event()
+
+        def synth(text, pause_ms, max_chars):
+            with guard:
+                state.active += 1
+                state.peak = max(state.peak, state.active)
+                state.calls += 1
+                (first_in if state.calls == 1 else second_in).set()
+            release.wait(5)
+            with guard:
+                state.active -= 1
+            return np.zeros(10, dtype=np.float32)
+
+        fake_load.synth_long = synth
+        with contextlib.ExitStack() as stack:
+            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack)
+            threads = [
+                threading.Thread(target=announce, args=("alert one",)),
+                threading.Thread(target=announce, args=("alert two",)),
+                threading.Thread(target=speak, args=("a reply", "chat", 1)),
+            ]
+            threads[0].start()
+            assert first_in.wait(5)
+            threads[1].start()
+            threads[2].start()
+            # While the first utterance is being made, nobody else gets to make theirs.
+            assert not second_in.wait(0.3)
+            release.set()
+            for thread in threads:
+                thread.join(5)
+        assert (state.calls, state.peak) == (3, 1)
+
+    def test_ending_the_chat_lets_the_utterance_in_progress_finish_and_drops_later_ones(
+        self, dataset_dir, tmp_path, fake_load, capsys
+    ):
+        state = SimpleNamespace(active=0)
+        started, release = threading.Event(), threading.Event()
+
+        def synth(text, pause_ms, max_chars):
+            state.active += 1
+            started.set()
+            release.wait(5)
+            state.active -= 1
+            return np.zeros(10, dtype=np.float32)
+
+        fake_load.synth_long = synth
+        with contextlib.ExitStack() as stack:
+            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack)
+            alert = threading.Thread(target=announce, args=("Too late?",))
+            alert.start()
+            assert started.wait(5)
+            threading.Timer(0.2, release.set).start()
+        # Leaving the with block waited for the alert to be spoken (the scratch directory
+        # is only removed after that)...
+        assert state.active == 0
+        alert.join(5)
+        # ...and from now on nothing is spoken any more.
+        calls = len(fake_load.calls)
+        speak("Anything.", "chat", 9)
+        announce("Anything else.")
+        assert len(fake_load.calls) == calls
+
+    def test_a_timer_speaks_while_the_chat_waits_for_input(
+        self, dataset_dir, tmp_path, fake_load, mocker, monkeypatch, capsys
+    ):
+        """End to end: real Assistant, real tools, real Scheduler; only the LLM HTTP call, the
+        voice model and the terminal are fake."""
+
+        def tool_call_reply():
+            call = {
+                "function": {"name": "set_timer", "arguments": {"seconds": 1, "message": "Tea."}}
+            }
+            return {"message": {"role": "assistant", "content": "", "tool_calls": [call]}}
+
+        def text_reply(text):
+            return {"message": {"role": "assistant", "content": text}}
+
+        def http(body):
+            return SimpleNamespace(ok=True, status_code=200, json=lambda: body, text=str(body))
+
+        post = mocker.patch(
+            "requests.post",
+            side_effect=[http(tool_call_reply()), http(text_reply("Timer set."))],
+        )
+        alert_spoken = threading.Event()
+        real_synth = fake_load.synth_long
+
+        def synth(text, pause_ms, max_chars):
+            wav = real_synth(text, pause_ms, max_chars)
+            if text == "Tea.":
+                alert_spoken.set()
+            return wav
+
+        fake_load.synth_long = synth
+        lines = iter(["Set a one second timer for tea."])
+
+        def input_then_wait(prompt=""):
+            try:
+                return next(lines)
+            except StopIteration:
+                # The main thread sits in input() while the timer thread fires, like a real chat.
+                assert alert_spoken.wait(10), "the timer never spoke"
+                return ""
+
+        monkeypatch.setattr("builtins.input", input_then_wait)
+
+        code, out, err = run(["chat", *voice_args(dataset_dir, tmp_path)], capsys)
+
+        assert code == 0
+        assert "Tools: set_timer" in out
+        assert "Herald: Timer set." in out
+        assert "[Herald] Tea." in out  # printed by the timer thread...
+        assert [c["text"] for c in fake_load.calls] == ["Timer set.", "Tea."]  # ...and spoken
+        assert "timer(s)" not in err  # it had already fired when the chat ended
+        assert post.call_count == 2
+
 
 # --- slim ---------------------------------------------------------------------------------------
 
@@ -1207,6 +1586,92 @@ class TestSlim:
 )
 def test_human_size(size, text):
     assert cli._human_size(size) == text
+
+
+# --- tools --------------------------------------------------------------------------------------
+
+
+class TestTools:
+    @pytest.fixture
+    def tools_dir(self, tmp_path):
+        path = tmp_path / "mine"
+        path.mkdir()
+        (path / "shout.py").write_text(SHOUT_TOOL, encoding="utf-8")
+        return path
+
+    def test_lists_builtin_and_own_tools_with_their_parameters(self, tools_dir, capsys):
+        code, out, err = run(["tools", "--tools-dir", str(tools_dir)], capsys)
+        assert code == 0 and err == ""
+        assert "set_timer  (builtin)" in out
+        assert "seconds (integer, required): " in out
+        assert "message (string): " in out  # optional: no "required"
+        assert f"shout  ({tools_dir / 'shout.py'})" in out
+        assert "  Repeat the text in capitals." in out
+        assert "    text (string, required): What to shout." in out
+        assert "    times (integer): How often (once if not said)." in out
+
+    def test_says_when_each_tool_is_offered(self, tools_dir, capsys):
+        (tools_dir / "whisper.py").write_text(WHISPER_TOOL, encoding="utf-8")
+        _, out, _ = run(["tools", "--tools-dir", str(tools_dir)], capsys)
+        blocks = {block.splitlines()[0].split()[0]: block for block in out.strip().split("\n\n")}
+        # A tool without trigger words is offered on every message...
+        assert "\n  always offered\n" in blocks["shout"] + "\n"
+        # ...one with them only when the message contains one of them (the full list is shown).
+        assert "\n  offered when the message contains: whisper, quiet\n" in blocks["whisper"] + "\n"
+        # The built-in timer has trigger words too, so that a small model is not tempted to set
+        # timers all the time.
+        assert "\n  offered when the message contains: " in blocks["set_timer"]
+
+    def test_a_broken_script_is_reported_and_fails_the_command(self, tools_dir, capsys):
+        (tools_dir / "broken.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+        code, out, err = run(["tools", "--tools-dir", str(tools_dir)], capsys)
+        assert code == 1
+        assert "shout  (" in out  # the good tools are still listed
+        assert err.count("error: ") == 1 and "broken.py" in err and "boom" in err
+
+    def test_a_missing_tools_directory_is_not_an_error(self, tmp_path, capsys):
+        code, out, _ = run(["tools", "--tools-dir", str(tmp_path / "nope")], capsys)
+        assert code == 0
+        assert "set_timer  (builtin)" in out
+
+    def test_default_directory_and_environment(self, tmp_path, monkeypatch, capsys):
+        import herald.tools
+
+        seen = []
+        real = herald.tools.load_tools
+
+        def load_tools(user_dir, context, **kwargs):
+            seen.append(user_dir)
+            return real(user_dir, context, **kwargs)
+
+        monkeypatch.setattr(herald.tools, "load_tools", load_tools)
+        run(["tools"], capsys)
+        monkeypatch.setenv("HERALD_TOOLS_DIR", str(tmp_path / "from_env"))
+        run(["tools"], capsys)
+        assert seen == [tmp_path / "project" / "tools", tmp_path / "from_env"]
+
+    def test_nothing_found(self, monkeypatch, capsys):
+        import herald.tools
+
+        nothing = LoadReport(ToolRegistry(), (), ())
+        monkeypatch.setattr(herald.tools, "load_tools", lambda user_dir, context, **kw: nothing)
+        code, out, _ = run(["tools"], capsys)
+        assert code == 0
+        assert out.strip() == "No tools found."
+
+    def test_the_scheduler_is_shut_down(self, monkeypatch, capsys):
+        import herald.tools.scheduler
+
+        stopped = []
+
+        class FakeScheduler:
+            def shutdown(self):
+                stopped.append(True)
+                return 0
+
+        monkeypatch.setattr(herald.tools.scheduler, "Scheduler", FakeScheduler)
+        run(["tools"], capsys)
+        assert stopped == [True]
 
 
 # --- download-checkpoints ------------------------------------------------------------------------

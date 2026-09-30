@@ -42,6 +42,7 @@ class Settings:
     checkpoint_dir: Path  # the base XTTS-v2 weights
     runs_dir: Path
     output_dir: Path
+    tools_dir: Path  # your own tool scripts (*.py) for the chat assistant
     checkpoint: Path | None = None  # fine-tuned checkpoint (file or run directory) to speak with
     checkpoint_url: str = DEFAULT_CHECKPOINT_URL
     device: str = "auto"
@@ -82,6 +83,7 @@ class Settings:
             checkpoint_dir=get_path("CHECKPOINT_DIR") or models_dir / paths.BASE_MODEL_SUBDIR,
             runs_dir=get_path("RUNS_DIR") or root / paths.DEFAULT_RUNS_SUBDIR,
             output_dir=get_path("OUTPUT_DIR") or root / paths.DEFAULT_OUTPUT_SUBDIR,
+            tools_dir=get_path("TOOLS_DIR") or root / paths.DEFAULT_TOOLS_SUBDIR,
             checkpoint=get_path("CHECKPOINT"),
             checkpoint_url=get("CHECKPOINT_URL") or DEFAULT_CHECKPOINT_URL,
             device=get("DEVICE") or "auto",

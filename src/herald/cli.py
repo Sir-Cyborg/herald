@@ -1,4 +1,6 @@
-"""Command line interface: ``herald synthesize | train | slim | chat | download-checkpoints``.
+"""Command line interface.
+
+``herald synthesize | train | slim | chat | tools | download-checkpoints``.
 
 This module must stay cheap to import so that ``herald --help`` is instant: torch,
 coqui-tts, numpy and requests are only imported inside the command handlers.
@@ -16,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -84,6 +87,17 @@ def _paths_parent(settings: Settings) -> argparse.ArgumentParser:
         type=Path,
         default=settings.checkpoint_dir,
         help="Base XTTS-v2 weights. Env: HERALD_CHECKPOINT_DIR.",
+    )
+    return p
+
+
+def _tools_parent(settings: Settings) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument(
+        "--tools-dir",
+        type=Path,
+        default=settings.tools_dir,
+        help="Directory with your own tool scripts (*.py). Env: HERALD_TOOLS_DIR.",
     )
     return p
 
@@ -256,7 +270,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p = add(
         "chat",
         "Talk to a local Ollama model and hear the replies in the cloned voice.",
-        parents=[_voice_parent(settings)],
+        parents=[_voice_parent(settings), _tools_parent(settings)],
     )
     p.add_argument("--ollama-url", default=settings.ollama_url, help="Env: HERALD_OLLAMA_URL.")
     p.add_argument(
@@ -290,7 +304,26 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Do not play the replies. Without --save-dir either, chat in text only "
         "(the voice model is not even loaded).",
     )
+    p.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="Plain chat: do not offer any tools (timers, your own scripts) to the model.",
+    )
+    p.add_argument(
+        "--always-offer-tools",
+        action="store_true",
+        help="Offer every tool on every message, ignoring the tools' trigger words. "
+        "Use it with models that handle tools well.",
+    )
     p.set_defaults(func=_cmd_chat)
+
+    # tools
+    p = add(
+        "tools",
+        "List the tools the assistant can use, built-in and from your tools directory.",
+        parents=[_tools_parent(settings)],
+    )
+    p.set_defaults(func=_cmd_tools)
 
     # download-checkpoints
     p = add(
@@ -558,28 +591,47 @@ def _synthesize_hint(args: argparse.Namespace, settings: Settings, model_path: P
     return " ".join(parts)
 
 
-def _build_assistant(args: argparse.Namespace, settings: Settings):
-    """The chat brain: an Ollama client wrapped in an Assistant (system prompt, history, tools)."""
-    from herald.assistant import Assistant
-    from herald.llm.ollama_client import OllamaClient
-
+def _chat_settings(args: argparse.Namespace, settings: Settings) -> tuple[str, float]:
+    """The system prompt and the Ollama timeout. Read first, so that a bad file or value fails
+    before the voice model is loaded."""
     system_prompt = (
         _read_utf8(args.system_prompt_file).strip()
         if args.system_prompt_file
         else args.system_prompt
     )
     timeout = args.ollama_timeout if args.ollama_timeout is not None else settings.ollama_timeout
+    return system_prompt, timeout
+
+
+def _build_assistant(args: argparse.Namespace, system_prompt: str, timeout: float, tools):
+    """The chat brain: an Ollama client wrapped in an Assistant (system prompt, history, tools)."""
+    from herald.assistant import Assistant
+    from herald.llm.ollama_client import OllamaClient
+
     client = OllamaClient(args.ollama_url, args.ollama_model, timeout=timeout)
-    return Assistant(client, system_prompt, history_turns=args.history)
+    return Assistant(
+        client,
+        system_prompt,
+        tools=tools,
+        history_turns=args.history,
+        use_triggers=not args.always_offer_tools,
+    )
 
 
 def _make_speaker(args: argparse.Namespace, settings: Settings, stack: contextlib.ExitStack):
-    """Load the voice and return ``say(text, turn)``, which speaks one chat reply.
+    """Load the voice and return ``speak(text, kind, number)``, which speaks one text.
 
-    Returns None for a text-only chat (``--no-play`` without ``--save-dir``): nothing would
-    be done with the audio, so the model is not loaded. Replies are kept in ``--save-dir``
-    when given; otherwise each one is written to a single scratch file, overwritten on every
-    turn and removed with its directory when ``stack`` closes, whatever ends the session.
+    ``kind`` is ``"chat"`` for a reply or ``"alert"`` for a timer, and only matters for the
+    file name. Returns None for a text-only chat (``--no-play`` without ``--save-dir``):
+    nothing would be done with the audio, so the model is not loaded. Texts are kept in
+    ``--save-dir`` when given; otherwise each one is written to a single scratch file,
+    overwritten every time and removed with its directory when ``stack`` closes, whatever
+    ends the session.
+
+    One lock serializes all speaking: a timer alert comes from another thread and must neither
+    overlap a reply nor overwrite the scratch file while the player reads it. When ``stack``
+    closes, the utterance in progress is allowed to finish and later ones are dropped, so
+    nothing is written into the scratch directory after it is removed.
     """
     if args.no_play and args.save_dir is None:
         print(
@@ -597,35 +649,104 @@ def _make_speaker(args: argparse.Namespace, settings: Settings, stack: contextli
         stack.enter_context(tempfile.TemporaryDirectory(prefix="herald-chat-"))
     )
     session = time.strftime("%Y%m%d_%H%M%S")
+    lock = threading.Lock()
+    closed = False
     warned_no_player = False
 
-    def say(text: str, turn: int) -> None:
-        nonlocal warned_no_player
-        wav = eng.synth_long(text, pause_ms=args.pause_ms, max_chars=args.max_chars)
-        # Saved replies are numbered; a scratch reply reuses one name, so only one is on disk.
-        name = f"chat_{session}_{turn:03d}.wav" if args.save_dir else "reply.wav"
-        path = engine.save_wav(folder / name, wav, eng.sample_rate)
-        if not args.no_play and not audio_playback.play_wav(path) and not warned_no_player:
-            warned_no_player = True
-            print(
-                "No audio player available; "
-                + (
-                    f"replies are saved in {args.save_dir}"
-                    if args.save_dir
-                    else "use --save-dir DIR to keep the replies as WAV files."
-                ),
-                file=sys.stderr,
-            )
+    def close() -> None:
+        nonlocal closed
+        with lock:  # waits for the utterance in progress
+            closed = True
 
-    return say
+    stack.callback(close)
+
+    def speak(text: str, kind: str, number: int) -> None:
+        nonlocal warned_no_player
+        with lock:
+            if closed:
+                return
+            wav = eng.synth_long(text, pause_ms=args.pause_ms, max_chars=args.max_chars)
+            # Saved texts are numbered; a scratch one reuses one name, so only one is on disk.
+            name = f"{kind}_{session}_{number:03d}.wav" if args.save_dir else "speech.wav"
+            path = engine.save_wav(folder / name, wav, eng.sample_rate)
+            if not args.no_play and not audio_playback.play_wav(path) and not warned_no_player:
+                warned_no_player = True
+                print(
+                    "No audio player available; "
+                    + (
+                        f"replies are saved in {args.save_dir}"
+                        if args.save_dir
+                        else "use --save-dir DIR to keep the replies as WAV files."
+                    ),
+                    file=sys.stderr,
+                )
+
+    return speak
+
+
+def _make_announcer(speak):
+    """The ``say`` function of the tools: a timer that fires prints and speaks its message.
+
+    It runs on a timer thread while the main thread waits in ``input()``, and never raises.
+    In a text-only chat (``speak`` is None) it only prints.
+    """
+    numbers = itertools.count(1)
+
+    def announce(text: str) -> None:
+        # One write, so the alert is not split by the main thread's own printing.
+        sys.stdout.write(f"\a\n[Herald] {text}\n")
+        sys.stdout.flush()
+        if speak is None:
+            return
+        try:
+            speak(text, "alert", next(numbers))
+        except Exception as exc:  # a failed alert must not kill the timer thread
+            logger.debug("Speech synthesis failed", exc_info=True)
+            print(f"error: could not speak the reply: {exc}", file=sys.stderr)
+
+    return announce
+
+
+def _stop_timers(scheduler) -> None:
+    cancelled = scheduler.shutdown()
+    if cancelled:
+        print(
+            f"{cancelled} timer(s) were still running and have been cancelled because the "
+            "chat ended.",
+            file=sys.stderr,
+        )
+
+
+def _load_chat_tools(args: argparse.Namespace, announce, stack: contextlib.ExitStack):
+    """Load the tools for the assistant: the registry, or None (``--no-tools``, none found).
+
+    The timers are cancelled when ``stack`` closes. Load errors are warnings: a broken tool
+    script must not stop the chat.
+    """
+    if args.no_tools:
+        return None
+    from herald.tools import ToolContext, load_tools
+    from herald.tools.scheduler import Scheduler
+
+    scheduler = Scheduler()
+    stack.callback(_stop_timers, scheduler)
+    report = load_tools(args.tools_dir, ToolContext(say=announce, scheduler=scheduler))
+    for error in report.errors:
+        print(f"warning: tools: {error}", file=sys.stderr)
+    if report.tools:
+        print("Tools: " + ", ".join(tool.name for tool in report.tools))
+    return report.registry if len(report.registry) else None
 
 
 def _cmd_chat(args: argparse.Namespace, settings: Settings) -> int:
     from herald.errors import OllamaError
 
-    assistant = _build_assistant(args, settings)
+    system_prompt, timeout = _chat_settings(args, settings)
     with contextlib.ExitStack() as stack:
-        say = _make_speaker(args, settings, stack)
+        speak = _make_speaker(args, settings, stack)
+        # Registered after the speaker, so the timers are cancelled before it closes.
+        tools = _load_chat_tools(args, _make_announcer(speak), stack)
+        assistant = _build_assistant(args, system_prompt, timeout, tools)
 
         print("Type a message; an empty line or Ctrl-D quits.")
         for turn in itertools.count(1):
@@ -643,14 +764,56 @@ def _cmd_chat(args: argparse.Namespace, settings: Settings) -> int:
                 continue
             print(f"Herald: {reply}")
 
-            if say is None:
+            if speak is None:
                 continue
             try:
-                say(reply, turn)
+                speak(reply, "chat", turn)
             except Exception as exc:  # one failed reply must not end the conversation
                 logger.debug("Speech synthesis failed", exc_info=True)
                 print(f"error: could not speak the reply: {exc}", file=sys.stderr)
     return 0
+
+
+def _describe_parameters(schema: dict) -> list[str]:
+    """``name (type, required): description`` for each parameter of a tool schema."""
+    parameters = schema.get("function", {}).get("parameters", {})
+    required = set(parameters.get("required", ()))
+    lines = []
+    for name, spec in parameters.get("properties", {}).items():
+        flags = f"{spec.get('type', 'any')}{', required' if name in required else ''}"
+        description = spec.get("description")
+        lines.append(f"{name} ({flags})" + (f": {description}" if description else ""))
+    return lines
+
+
+def _cmd_tools(args: argparse.Namespace, settings: Settings) -> int:
+    from herald.tools import ToolContext, load_tools
+    from herald.tools.scheduler import Scheduler
+
+    scheduler = Scheduler()
+    try:
+        report = load_tools(args.tools_dir, ToolContext(say=print, scheduler=scheduler))
+    finally:
+        scheduler.shutdown()
+
+    schemas = {s["function"]["name"]: s for s in report.registry.schemas()}
+    for tool in report.tools:
+        print(f"{tool.name}  ({tool.source})")
+        for line in tool.description.splitlines():
+            print(f"  {line}")
+        print(
+            f"  offered when the message contains: {', '.join(tool.triggers)}"
+            if tool.triggers
+            else "  always offered"
+        )
+        for line in _describe_parameters(schemas.get(tool.name, {})):
+            print(f"    {line}")
+        print()
+    if not report.tools:
+        print("No tools found.")
+    for error in report.errors:
+        print(f"error: {error}", file=sys.stderr)
+    return 1 if report.errors else 0
 
 
 # --- entry point ------------------------------------------------------------------------------

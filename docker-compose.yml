@@ -67,6 +67,8 @@ services:
       - ./models:/app/models
       - ./runs:/app/runs
       - ./output:/app/output
+      # The user's tool scripts (committed to git). The container only reads them: edit on the host.
+      - ./tools:/app/tools:ro
     stdin_open: true # `chat` reads from the terminal
     tty: true
     # A herald server would publish its port here: `ports: ["8000:8000"]`.

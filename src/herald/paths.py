@@ -5,6 +5,7 @@
     dataset/<speaker>/audio/*.wav + metadata.csv
     models/xtts_v2/        base weights
     models/<speaker>/      fine-tuned voice (best_model.pth)
+    tools/*.py             your own tools for the chat assistant
     runs/                  training logs and TensorBoard data
     output/                generated audio
 """
@@ -20,6 +21,7 @@ ROOT_ENV = "HERALD_PROJECT_ROOT"
 # Default locations, relative to the project root.
 DEFAULT_DATASET_SUBDIR = Path("dataset") / "frieren"
 DEFAULT_MODELS_SUBDIR = Path("models")
+DEFAULT_TOOLS_SUBDIR = Path("tools")
 DEFAULT_RUNS_SUBDIR = Path("runs")
 DEFAULT_OUTPUT_SUBDIR = Path("output")
 

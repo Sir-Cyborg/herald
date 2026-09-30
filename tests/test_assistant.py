@@ -52,27 +52,31 @@ def started():
     return []
 
 
-@pytest.fixture
-def timers(started):
-    """A registry with one `set_timer` tool."""
+def timer_tool(started, **options):
+    """A `set_timer` tool that records the seconds it was asked for."""
 
-    def set_timer(seconds: int) -> str:
+    def set_timer(seconds: int, message: str = "") -> str:
         started.append(seconds)
         return f"timer set for {seconds} seconds"
 
-    registry = ToolRegistry()
-    registry.register(
-        Tool(
-            name="set_timer",
-            description="Start a countdown timer.",
-            parameters={
-                "type": "object",
-                "properties": {"seconds": {"type": "integer"}},
-                "required": ["seconds"],
-            },
-            handler=set_timer,
-        )
+    return Tool(
+        name="set_timer",
+        description="Start a countdown timer.",
+        parameters={
+            "type": "object",
+            "properties": {"seconds": {"type": "integer"}, "message": {"type": "string"}},
+            "required": ["seconds"],
+        },
+        handler=set_timer,
+        **options,
     )
+
+
+@pytest.fixture
+def timers(started):
+    """A registry with one `set_timer` tool, offered on every message."""
+    registry = ToolRegistry()
+    registry.register(timer_tool(started))
     return registry
 
 
@@ -375,153 +379,6 @@ def test_assistant_works_with_the_real_client_over_http(mocker, timers):
     ]
 
 
-# --- Tool and ToolRegistry --------------------------------------------------------------------
-
-
-def test_tool_schema_is_an_ollama_function_schema():
-    parameters = {"type": "object", "properties": {"city": {"type": "string"}}}
-    tool = Tool("weather", "Look up the weather.", parameters, lambda city: "sunny")
-    assert tool.schema() == {
-        "type": "function",
-        "function": {
-            "name": "weather",
-            "description": "Look up the weather.",
-            "parameters": parameters,
-        },
-    }
-
-
-def test_registry_lists_schemas_and_counts_tools(timers):
-    assert len(ToolRegistry()) == 0
-    assert not ToolRegistry()
-    assert len(timers) == 1
-    assert timers
-    assert [s["function"]["name"] for s in timers.schemas()] == ["set_timer"]
-
-
-def test_registering_a_duplicate_name_is_an_error(timers):
-    duplicate = Tool("set_timer", "Another.", {"type": "object"}, lambda: "x")
-    with pytest.raises(ValueError, match="set_timer"):
-        timers.register(duplicate)
-
-
-def test_registry_call_runs_the_handler(timers):
-    assert timers.call(ToolCall("set_timer", {"seconds": 3})) == "timer set for 3 seconds"
-
-
-def test_registry_call_turns_the_result_into_text():
-    registry = ToolRegistry()
-    registry.register(Tool("answer", "The answer.", {"type": "object"}, lambda: 42))
-    assert registry.call(ToolCall("answer", {})) == "42"
-
-
-def make_registry(handler):
-    registry = ToolRegistry()
-    registry.register(
-        Tool(
-            "add",
-            "Add two numbers.",
-            {
-                "type": "object",
-                "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-                "required": ["a"],
-            },
-            handler,
-        )
-    )
-    return registry
-
-
-@pytest.mark.parametrize(
-    ("call", "expected"),
-    [
-        (ToolCall("nope", {}), "unknown tool 'nope'"),
-        (ToolCall("add", {}), "invalid arguments for add: missing a"),
-        (ToolCall("add", {"a": 1, "loud": True}), "invalid arguments for add: unknown loud"),
-        (ToolCall("add", {"a": "1"}), "invalid arguments for add: a must be of type number"),
-        (ToolCall("add", {"a": 1, "b": 0}), "add failed: ZeroDivisionError"),  # inside the handler
-    ],
-    ids=["unknown-tool", "missing", "unknown-argument", "wrong-type", "handler-error"],
-)
-def test_registry_call_never_raises(caplog, call, expected):
-    registry = make_registry(lambda a, b=1: a / b)
-    with caplog.at_level(logging.WARNING, logger="herald.assistant"):
-        result = registry.call(call)
-
-    assert result.startswith("error: ")
-    assert expected in result
-    assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-def test_invalid_arguments_never_reach_the_handler():
-    calls = []
-    registry = make_registry(lambda **kwargs: calls.append(kwargs) or "ok")
-    for arguments in ({}, {"a": "x"}, {"a": 1, "extra": 2}):
-        assert registry.call(ToolCall("add", arguments)).startswith("error:")
-    assert calls == []
-    assert registry.call(ToolCall("add", {"a": 1, "b": 2.5})) == "ok"
-    assert calls == [{"a": 1, "b": 2.5}]
-
-
-def check(schema, arguments):
-    """Run `arguments` through a tool with `schema`; True if the handler was reached."""
-    registry = ToolRegistry()
-    registry.register(Tool("t", "Test.", schema, lambda **kwargs: "ok"))
-    return registry.call(ToolCall("t", arguments)) == "ok"
-
-
-def typed(json_type):
-    return {"type": "object", "properties": {"x": {"type": json_type}}}
-
-
-@pytest.mark.parametrize(
-    ("json_type", "good", "bad"),
-    [
-        ("string", ["", "a"], [1, None, True, ["a"]]),
-        ("integer", [0, 5, -3], [1.5, "1", True, False, None]),
-        ("number", [0, 1.5, -2], ["1", True, None]),
-        ("boolean", [True, False], [0, 1, "true", None]),
-        ("array", [[], [1, "a"]], [{}, "a", None]),
-        ("object", [{}, {"k": 1}], [[], "a", None]),
-    ],
-)
-def test_argument_types_are_checked(json_type, good, bad):
-    schema = typed(json_type)
-    assert all(check(schema, {"x": value}) for value in good)
-    assert not any(check(schema, {"x": value}) for value in bad)
-
-
-def test_optional_and_untyped_arguments():
-    schema = {
-        "type": "object",
-        "properties": {"x": {"type": "string"}, "y": {}, "z": {"type": ["a"]}},
-    }
-    assert check(schema, {})  # nothing is required
-    assert check(schema, {"y": [1, 2], "z": 3})  # no type, or a type we do not check
-
-
-def test_extra_arguments_are_only_allowed_when_the_schema_says_so():
-    strict = {"type": "object", "properties": {"x": {"type": "string"}}}
-    assert not check(strict, {"x": "a", "other": 1})
-    assert not check({"type": "object"}, {"other": 1})
-    assert not check({**strict, "additionalProperties": False}, {"other": 1})
-    assert check({**strict, "additionalProperties": True}, {"x": "a", "other": 1})
-    assert check({"type": "object", "additionalProperties": True}, {"other": 1})
-
-
-def test_a_long_result_is_cut_before_it_reaches_the_model():
-    registry = ToolRegistry()
-    registry.register(Tool("dump", "Lots of text.", {"type": "object"}, lambda: "x" * 5000))
-    result = registry.call(ToolCall("dump", {}))
-    assert result == "x" * 2000 + "…"
-
-
-def test_a_result_at_the_limit_is_left_alone():
-    registry = ToolRegistry()
-    registry.register(Tool("dump", "Text.", {"type": "object"}, lambda: "x" * 2000))
-    assert registry.call(ToolCall("dump", {})) == "x" * 2000
-
-
 def test_the_model_gets_the_cut_result():
     registry = ToolRegistry()
     registry.register(Tool("dump", "Lots of text.", {"type": "object"}, lambda: "y" * 5000))
@@ -531,10 +388,408 @@ def test_the_model_gets_the_cut_result():
     assert tool_message["content"] == "y" * 2000 + "…"
 
 
-def test_long_error_texts_are_cut_too():
-    def broken() -> str:
-        raise RuntimeError("z" * 5000)
+# --- tool calls written as text -----------------------------------------------------------------
 
+SET_TIMER_TEXT = '{"name": "set_timer", "parameters": {"seconds": 60}}'
+
+
+def test_a_tool_call_written_as_text_is_run_like_a_real_one(timers, started):
+    llm = ScriptedLLM(say(SET_TIMER_TEXT), say("Your timer is running."))
+    assistant = Assistant(llm, "Be brief.", tools=timers)
+
+    assert assistant.respond("Timer for a minute") == "Your timer is running."
+
+    assert started == [60]
+    assert llm.calls[1][0][2:] == [
+        {
+            "role": "assistant",
+            "content": "",  # the JSON text is gone from the transcript
+            "tool_calls": [{"function": {"name": "set_timer", "arguments": {"seconds": 60}}}],
+        },
+        {"role": "tool", "tool_name": "set_timer", "content": "timer set for 60 seconds"},
+    ]
+    assert assistant.history == [
+        user("Timer for a minute"),
+        assistant_text("Your timer is running."),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"name": "set_timer", "arguments": {"seconds": 60}}',  # "arguments" instead
+        '{"type": "function", "name": "set_timer", "parameters": {"seconds": 60}}',
+        '  \n{"name": "set_timer", "parameters": {"seconds": 60}}\n  ',
+        '```json\n{"name": "set_timer", "parameters": {"seconds": 60}}\n```',
+        '```JSON {"name": "set_timer", "parameters": {"seconds": 60}} ```',
+        '```\n{"name": "set_timer", "parameters": {"seconds": 60}}\n```',
+        '\n```json\n{"name": "set_timer", "parameters": {"seconds": 60}}\n```\n',
+    ],
+    ids=[
+        "arguments-key",
+        "with-type",
+        "whitespace",
+        "json-fence",
+        "inline-fence",
+        "bare-fence",
+        "padded",
+    ],
+)
+def test_the_usual_ways_of_writing_a_call_as_text_are_understood(timers, started, text):
+    llm = ScriptedLLM(say(text), say("Done, one minute."))
+    assert Assistant(llm, "Be brief.", tools=timers).respond("Timer") == "Done, one minute."
+    assert started == [60]
+
+
+def test_a_call_to_an_unknown_tool_is_never_spoken(timers, started, caplog):
+    invented = '{"name": "wikipedia", "parameters": {"query": "elves"}}'
+    llm = ScriptedLLM(say(invented))
+    assistant = Assistant(llm, "Be brief.", tools=timers)
+
+    with caplog.at_level(logging.WARNING, logger="herald.assistant"):
+        text = assistant.respond("Tell me about elves")
+
+    assert text == "Sorry, I could not do that."
+    assert started == []
+    assert len(llm.calls) == 1
+    assert assistant.history == [user("Tell me about elves"), assistant_text(text)]
+    assert "wikipedia" in caplog.text
+
+
+def test_an_unknown_tool_after_a_tool_ran_is_answered_with_done(timers, started):
+    llm = ScriptedLLM(
+        call_tools(("set_timer", {"seconds": 5})),
+        say('{"name": "wikipedia", "parameters": {}}'),
+    )
+    assistant = Assistant(llm, "Be brief.", tools=timers)
+
+    assert assistant.respond("Timer") == "Done."
+    assert started == [5]
+    assert assistant.history == [user("Timer"), assistant_text("Done.")]
+
+
+def test_text_the_model_wrote_before_the_tool_is_still_preferred(timers):
+    llm = ScriptedLLM(
+        call_tools(("set_timer", {"seconds": 5}), content="Timer started."),
+        say('{"name": "wikipedia", "parameters": {}}'),
+    )
+    assert Assistant(llm, "Be brief.", tools=timers).respond("Timer") == "Timer started."
+
+
+def test_a_recovered_call_with_bad_arguments_gets_the_error_back_like_any_other(timers, started):
+    """The first real-world failure: the model forgot the required `seconds`."""
+    llm = ScriptedLLM(
+        say('{"name": "set_timer", "parameters": {"message": "Tea is ready"}}'),
+        say('{"name": "set_timer", "parameters": {"seconds": 120, "message": "Tea is ready"}}'),
+        say("Timer set."),
+    )
+    assistant = Assistant(llm, "Be brief.", tools=timers)
+
+    assert assistant.respond("Tea timer, 2 minutes") == "Timer set."
+
+    (first_error,) = [m for m in llm.calls[1][0] if m["role"] == "tool"]
+    assert first_error["content"] == "error: invalid arguments for set_timer: missing seconds"
+    assert started == [120]
+
+
+def test_a_numeric_string_from_the_model_reaches_the_handler_as_a_number(timers, started):
+    """The other real-world failure: `"seconds": "120"`."""
+    llm = ScriptedLLM(call_tools(("set_timer", {"seconds": "120"})), say("Two minutes, set."))
+    assert Assistant(llm, "Be brief.", tools=timers).respond("Timer") == "Two minutes, set."
+    assert started == [120]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"Sure, this is the call: {SET_TIMER_TEXT} and that is all.",
+        f"{SET_TIMER_TEXT} Hope that helps!",
+        f"Here you go:\n```json\n{SET_TIMER_TEXT}\n```\nAnything else?",
+        f"```json\n{SET_TIMER_TEXT}\n```\n```json\n{SET_TIMER_TEXT}\n```",
+    ],
+    ids=["in-the-middle", "trailing-prose", "fence-inside-prose", "two-fences"],
+)
+def test_json_inside_normal_prose_is_left_alone(timers, started, text):
+    llm = ScriptedLLM(say(text))
+    assistant = Assistant(llm, "Be brief.", tools=timers)
+
+    assert assistant.respond("Show me the JSON") == text
+    assert started == []
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"name": "set_timer"}',  # no parameters
+        '{"name": "set_timer", "parameters": "60"}',  # parameters is not an object
+        '{"name": "set_timer", "parameters": [60]}',
+        '{"name": 7, "parameters": {}}',  # name is not a string
+        '{"parameters": {"seconds": 60}}',  # no name
+        '{"name": "set_timer", "parameters": {"seconds": 60}',  # not valid JSON
+        '[{"name": "set_timer", "parameters": {"seconds": 60}}]',  # a list, not an object
+        '{"city": "Paris", "temperature": 21}',  # JSON, but not a call
+        '"just a string"',
+        "{}",
+        "{",
+    ],
+)
+def test_json_that_is_not_a_tool_call_is_left_alone(timers, started, text):
+    llm = ScriptedLLM(say(text))
+    assert Assistant(llm, "Be brief.", tools=timers).respond("Hi") == text
+    assert started == []
+
+
+@pytest.mark.parametrize("registry", [None, ToolRegistry()], ids=["no-registry", "empty-registry"])
+def test_without_tools_a_json_answer_is_left_alone(registry):
+    """In plain chat a user may legitimately get JSON back."""
+    text = '{"name": "set_timer", "parameters": {"seconds": 60}}'
+    llm = ScriptedLLM(say(text))
+    assistant = Assistant(llm, "Be brief.", tools=registry)
+
+    assert assistant.respond("Give me JSON") == text
+    assert assistant.history[-1] == assistant_text(text)
+
+
+def test_the_repair_applies_to_later_replies_too(timers, started):
+    llm = ScriptedLLM(
+        call_tools(("set_timer", {"seconds": 1})),
+        say('{"name": "set_timer", "parameters": {"seconds": 2}}'),
+        say("Two timers."),
+    )
+    assert Assistant(llm, "Be brief.", tools=timers).respond("Two timers") == "Two timers."
+    assert started == [1, 2]
+
+
+def test_recovered_calls_count_toward_the_step_limit(timers, started):
+    llm = ScriptedLLM(*[say(SET_TIMER_TEXT)] * 10)
+    assistant = Assistant(llm, "Be brief.", tools=timers, max_tool_steps=2)
+
+    text = assistant.respond("Loop")
+
+    assert text == "Sorry, I could not finish that."
+    assert started == [60, 60]  # two rounds ran; the third call is not executed
+    assert len(llm.calls) == 3
+    assert assistant.history == [user("Loop"), assistant_text(text)]
+
+
+def test_a_call_written_as_text_over_http_reaches_ollama_as_a_proper_tool_call(
+    mocker, timers, started
+):
+    post = mocker.patch(
+        "requests.post",
+        side_effect=[
+            http_reply({"role": "assistant", "content": "```json\n" + SET_TIMER_TEXT + "\n```"}),
+            http_reply({"role": "assistant", "content": "Sixty seconds."}),
+        ],
+    )
+    assistant = Assistant(OllamaClient(model="m"), "Be brief.", tools=timers)
+
+    assert assistant.respond("A minute please") == "Sixty seconds."
+
+    second = post.call_args_list[1].kwargs["json"]
+    assert second["messages"][-2:] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "set_timer", "arguments": {"seconds": 60}}}],
+        },
+        {"role": "tool", "tool_name": "set_timer", "content": "timer set for 60 seconds"},
+    ]
+    assert started == [60]
+
+
+# --- triggers: which tools the model is offered -------------------------------------------------
+
+
+@pytest.fixture
+def gated(started):
+    """`set_timer` only for messages mentioning a timer, next to an always available `clock`."""
     registry = ToolRegistry()
-    registry.register(Tool("boom", "Fails.", {"type": "object"}, broken))
-    assert len(registry.call(ToolCall("boom", {}))) == 2001
+    registry.register(Tool("clock", "The time.", {"type": "object"}, lambda: "12:00"))
+    registry.register(timer_tool(started, triggers=("timer", "sveglia")))
+    return registry
+
+
+def offered(llm, call=0):
+    """The tool names the model was offered in request number `call`."""
+    tools = llm.calls[call][1]
+    return None if tools is None else [t["function"]["name"] for t in tools]
+
+
+@pytest.mark.parametrize(
+    "message", ["What is the capital of France?", "Tell me a joke.", "Come stai oggi?"]
+)
+def test_a_message_without_triggers_is_plain_chat(started, message):
+    registry = ToolRegistry()
+    registry.register(timer_tool(started, triggers=("timer", "sveglia")))
+    llm = ScriptedLLM(say("Paris."))
+    assistant = Assistant(llm, "Be brief.", tools=registry)
+
+    assert assistant.respond(message) == "Paris."
+
+    assert llm.calls == [([SYSTEM, user(message)], None)]  # no tools at all
+    assert assistant.history == [user(message), assistant_text("Paris.")]
+
+
+def test_a_message_with_a_trigger_offers_the_tool(started):
+    registry = ToolRegistry()
+    registry.register(timer_tool(started, triggers=("timer", "sveglia")))
+    llm = ScriptedLLM(call_tools(("set_timer", {"seconds": 300})), say("Five minutes, set."))
+    assistant = Assistant(llm, "Be brief.", tools=registry)
+
+    assert assistant.respond("Set a TIMER for five minutes") == "Five minutes, set."
+
+    assert llm.calls[0][1] == registry.schemas()
+    assert started == [300]
+
+
+def test_tools_without_triggers_are_offered_with_every_message(gated):
+    llm = ScriptedLLM(say("a"), say("b"))
+    assistant = Assistant(llm, "Be brief.", tools=gated)
+    assistant.respond("Tell me a joke")
+    assistant.respond("Metti una sveglia")
+    assert offered(llm, 0) == ["clock"]
+    assert offered(llm, 1) == ["clock", "set_timer"]
+
+
+def test_the_offered_tools_are_decided_again_for_each_message(gated):
+    """Only the current message counts, not the history (documented limit of triggers)."""
+    llm = ScriptedLLM(say("How long?"), say("Okay."))
+    assistant = Assistant(llm, "Be brief.", tools=gated)
+    assistant.respond("Set a timer")
+    assistant.respond("Five minutes")
+    assert offered(llm, 0) == ["clock", "set_timer"]
+    assert offered(llm, 1) == ["clock"]
+
+
+def test_a_multi_step_turn_keeps_the_same_offered_tools(gated, started):
+    llm = ScriptedLLM(
+        call_tools(("clock", {})),
+        call_tools(("set_timer", {"seconds": 5})),
+        say("All done."),
+    )
+    assistant = Assistant(llm, "Be brief.", tools=gated)
+
+    assert assistant.respond("Check the time, then set a timer") == "All done."
+
+    assert [offered(llm, i) for i in range(3)] == [["clock", "set_timer"]] * 3
+    assert started == [5]
+
+
+def test_a_multi_step_turn_without_a_trigger_keeps_the_tool_out(gated, started):
+    llm = ScriptedLLM(call_tools(("clock", {})), say("It is noon."))
+    assert Assistant(llm, "Be brief.", tools=gated).respond("What time is it?") == "It is noon."
+    # The same set is offered on the second step: the turn keeps its decision.
+    assert [offered(llm, i) for i in range(2)] == [["clock"], ["clock"]]
+    assert started == []
+
+
+def test_a_call_to_a_tool_that_was_not_offered_is_refused(gated, started):
+    llm = ScriptedLLM(call_tools(("set_timer", {"seconds": 5})), say("I cannot set timers."))
+    assistant = Assistant(llm, "Be brief.", tools=gated)
+
+    assert assistant.respond("Tell me a joke") == "I cannot set timers."
+
+    assert started == []
+    assert llm.calls[1][0][-2:] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "set_timer", "arguments": {"seconds": 5}}}],
+        },
+        {"role": "tool", "tool_name": "set_timer", "content": "error: unknown tool 'set_timer'"},
+    ]
+
+
+def test_with_nothing_offered_a_tool_call_is_refused_too(started):
+    registry = ToolRegistry()
+    registry.register(timer_tool(started, triggers=("timer",)))
+    llm = ScriptedLLM(call_tools(("set_timer", {"seconds": 5})), say("Sorry, no."))
+
+    assert Assistant(llm, "Be brief.", tools=registry).respond("Hello") == "Sorry, no."
+
+    assert [llm.calls[0][1], llm.calls[1][1]] == [None, None]
+    assert started == []
+
+
+def test_use_triggers_false_offers_every_tool_every_time(gated, started):
+    llm = ScriptedLLM(call_tools(("set_timer", {"seconds": 5})), say("Timer set."))
+    assistant = Assistant(llm, "Be brief.", tools=gated, use_triggers=False)
+
+    assert assistant.respond("Tell me a joke") == "Timer set."
+
+    assert llm.calls[0][1] == gated.schemas()
+    assert offered(llm, 0) == ["clock", "set_timer"]
+    assert started == [5]
+
+
+def test_use_triggers_is_on_by_default(gated):
+    llm = ScriptedLLM(say("ok"))
+    Assistant(llm, "Be brief.", tools=gated).respond("Hello")
+    assert offered(llm) == ["clock"]
+
+
+def test_inline_json_naming_a_tool_that_was_not_offered_is_never_spoken(started):
+    registry = ToolRegistry()
+    registry.register(timer_tool(started, triggers=("timer",)))
+    llm = ScriptedLLM(say('{"name": "set_timer", "parameters": {"seconds": 60}}'))
+    assistant = Assistant(llm, "Be brief.", tools=registry)
+
+    text = assistant.respond("What is the capital of France?")
+
+    assert text == "Sorry, I could not do that."
+    assert started == []
+    assert len(llm.calls) == 1
+    assert assistant.history == [user("What is the capital of France?"), assistant_text(text)]
+
+
+def test_inline_json_for_a_tool_that_was_not_offered_after_a_tool_ran_is_answered_with_done(
+    gated, started
+):
+    llm = ScriptedLLM(
+        call_tools(("clock", {})),
+        say('{"name": "set_timer", "parameters": {"seconds": 60}}'),
+    )
+    assert Assistant(llm, "Be brief.", tools=gated).respond("What time is it?") == "Done."
+    assert started == []
+
+
+def test_inline_json_for_an_offered_tool_is_still_run(gated, started):
+    llm = ScriptedLLM(
+        say('{"name": "set_timer", "parameters": {"seconds": 60}}'),
+        say("One minute."),
+    )
+    assert Assistant(llm, "Be brief.", tools=gated).respond("A timer please") == "One minute."
+    assert started == [60]
+
+
+def test_the_triggers_work_with_the_real_client_over_http(mocker, started):
+    registry = ToolRegistry()
+    registry.register(timer_tool(started, triggers=("timer",)))
+    post = mocker.patch(
+        "requests.post",
+        side_effect=[
+            http_reply({"role": "assistant", "content": "Paris."}),
+            http_reply(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "set_timer", "arguments": {"seconds": 9}}}
+                    ],
+                }
+            ),
+            http_reply({"role": "assistant", "content": "Nine seconds."}),
+        ],
+    )
+    assistant = Assistant(OllamaClient(model="m"), "Be brief.", tools=registry)
+
+    assistant.respond("What is the capital of France?")
+    assistant.respond("Set a timer for nine seconds")
+
+    bodies = [call.kwargs["json"] for call in post.call_args_list]
+    assert "tools" not in bodies[0]  # plain chat: nothing was offered
+    assert [t["function"]["name"] for t in bodies[1]["tools"]] == ["set_timer"]
+    assert [t["function"]["name"] for t in bodies[2]["tools"]] == ["set_timer"]
+    assert started == [9]

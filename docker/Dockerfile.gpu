@@ -59,10 +59,11 @@ ARG UID=1000
 ARG GID=1000
 RUN groupadd --non-unique --gid "$GID" herald \
     && useradd --non-unique --uid "$UID" --gid herald --create-home herald \
-    && mkdir -p dataset models runs output \
+    && mkdir -p dataset models runs output tools \
     && chown herald:herald . dataset models runs output
 USER herald
 
-# dataset/, models/, runs/ and output/ are bind-mounted (see docker-compose.yml).
+# dataset/, models/, runs/, output/ and tools/ are bind-mounted (see docker-compose.yml);
+# tools/ is read-only, so it stays root-owned.
 ENTRYPOINT ["herald"]
 CMD ["--help"]

@@ -9,6 +9,7 @@ herald synthesize             speak a text to a WAV file (base or fine-tuned voi
 herald train                  fine-tune XTTS-v2 on a dataset
 herald slim                   shrink a trained voice to a third of its size
 herald chat                   chat with an Ollama model and hear the answers
+herald tools                  list the tools the assistant can use (yours and the built-in ones)
 herald download-checkpoints   fetch the base XTTS-v2 weights (about 2 GB)
 ```
 
@@ -168,6 +169,7 @@ models/xtts_v2/            base XTTS-v2 weights                (downloaded, not 
 models/<speaker>/          fine-tuned voice: best_model.pth    (produced by `herald train`)
 runs/                      training logs and TensorBoard data
 output/                    generated audio
+tools/                     your own tool scripts for the assistant   (in git; see tools/README.md)
 POC/                       the original notebook and its samples (local only, not in git)
 src/herald/                the package
 tests/                     unit tests (no model, no network) and integration tests
@@ -379,6 +381,46 @@ Two practical details for non-English speech:
   `herald chat --language it --system-prompt "Sei Frieren, un'elfa maga. Rispondi sempre in italiano, in una o due frasi brevi."`.
   Llama 3.2 lists Italian among its supported languages; small models are weaker outside English.
 
+### Tools
+
+`herald chat` can let the assistant **do** things, not just talk. It calls a tool by itself
+when what you say needs one. Herald ships with one, `set_timer`:
+
+```
+You: set a timer for 10 minutes, the pasta will be ready
+Herald: The timer has been set.
+   ... ten minutes later, even while the prompt is waiting for you ...
+[Herald] The pasta will be ready
+```
+
+The alert is printed and spoken in the cloned voice, in the language of the conversation (the
+model writes it). Timers live in memory: when the chat ends, pending ones are cancelled and
+Herald says so. The clock does not advance while the computer sleeps.
+
+**Your own tools.** Drop a Python script into the `tools/` folder and the assistant can use it
+the next time `chat` starts: a function with `@tool` on top is all it takes, and Herald builds
+the rest from its type hints and docstring. [`tools/README.md`](tools/README.md) explains it
+step by step, and `tools/_example.py` has working examples.
+
+```bash
+herald tools                     # what the assistant can use, and any script that failed to load
+herald chat --no-tools           # a plain chat, without tools
+herald chat --tools-dir my_dir   # another folder (or HERALD_TOOLS_DIR)
+```
+
+A tool is only offered to the model when your message contains one of the tool's trigger words
+(`set_timer` knows "timer", "minutes", "sveglia", "avvisami" and similar in several languages).
+Without this, small models call a tool on almost every message, even for "how are you?".
+`--always-offer-tools` switches the filter off for models that handle tools well.
+
+Two things to know:
+- **Your scripts run with your privileges**, and the model picks their arguments. Read the
+  safety notes in `tools/README.md` before writing anything that touches files or programs.
+- **Small models are unreliable with tools.** `llama3.2:3b` sometimes misses a request, calls a
+  tool nobody asked for, or sends numbers as text. Herald forgives the common slips (numbers
+  written as strings, a tool call printed as plain JSON), but a larger model behaves better:
+  try `--ollama-model` with one you have pulled.
+
 ## Configuration
 
 Every setting has an environment variable; a command line option overrides it. Empty variables
@@ -392,6 +434,7 @@ count as unset. Relative paths are resolved from the directory you run herald in
 | `HERALD_CHECKPOINT_DIR` | `<models dir>/xtts_v2` | Base XTTS-v2 weights |
 | `HERALD_CHECKPOINT` | none (base voice) | Fine-tuned voice for `synthesize` and `chat` |
 | `HERALD_RUNS_DIR` | `<root>/runs` | Training runs |
+| `HERALD_TOOLS_DIR` | `<root>/tools` | Your tool scripts for `chat` |
 | `HERALD_OUTPUT_DIR` | `<root>/output` | Generated audio |
 | `HERALD_DEVICE` | `auto` | `auto` (cuda, then mps, then cpu), `cpu`, `mps`, `cuda`, `cuda:N` |
 | `HERALD_LANGUAGE` | `en` | Language code passed to XTTS |
@@ -421,42 +464,29 @@ ruff and the unit tests, and validates the Compose files on every push and pull 
 src/herald/
   config.py, paths.py        settings from HERALD_* variables; project paths
   dataset/metadata.py        metadata loading, audio lookup, reference clips, train/eval split
+  dataset/audio_stats.py     checks the recordings before training (length, rate, channels)
   tts/checkpoints.py         base weight download
   tts/engine.py              model loading, synthesis (short, long, streamed), WAV output
   tts/train.py               fine-tuning and promotion of the best model
+  tts/slim.py                drops the optimizer state from a checkpoint (`herald slim`)
   llm/ollama_client.py       Ollama chat client (text and tool calls)
   assistant.py               conversation state and the tool-calling loop
+  tools/                     the tool framework: @tool, registry, loader, scheduler
+  tools/builtin/             the tools that ship with Herald (set_timer)
   audio_playback.py          best-effort playback
   cli.py                     the `herald` command
+tools/                       your own tool scripts (not part of the package)
 ```
 
 ## Where it is going
 
 Herald is meant to become a voice-controlled home assistant: an Ollama model that can *do*
-things (timers first), speaking through an ESP32 while Ollama and XTTS run on a PC. Only the
-foundations exist today:
+things, speaking through an ESP32 while Ollama and XTTS run on a PC. Timers and the tool
+framework exist today; the ESP32 side does not:
 
-- **Tools.** `herald.assistant.Assistant` already runs Ollama's tool-calling loop, but no tool is
-  registered yet. Adding one is a small change:
-
-  ```python
-  from herald.assistant import Assistant, Tool, ToolRegistry
-
-  tools = ToolRegistry()
-  tools.register(Tool(
-      name="set_timer",
-      description="Start a countdown timer.",
-      parameters={"type": "object",
-                  "properties": {"seconds": {"type": "integer"}},
-                  "required": ["seconds"]},
-      handler=lambda seconds: f"Timer set for {seconds} seconds.",
-  ))
-  assistant = Assistant(client, system_prompt, tools=tools)
-  ```
-
-  A handler returns a short text for the model; errors are handed back to the model instead of
-  crashing the conversation. A timer that must *speak later* needs a scheduler and a way to
-  push audio; that part is not designed yet.
+- **More tools.** The framework is in place (see [Tools](#tools)): a new capability is one
+  function. Next candidates are listing and cancelling timers, and anything you add to `tools/`.
+  A timer only lives while the chat runs; timers that survive a restart would need storage.
 - **Speech.** `XttsEngine` is a long-lived object, and `synth_stream()` yields audio chunk by
   chunk, so a server can start sending audio before the whole reply is synthesized. `chat` still
   waits for the full reply.

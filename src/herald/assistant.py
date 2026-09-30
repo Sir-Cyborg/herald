@@ -3,28 +3,23 @@
 This module knows nothing about the terminal or about speech. The CLI chat loop (and, later, any
 other front end) feeds it the user's text and speaks whatever ``Assistant.respond`` returns.
 
-To add a tool, build a :class:`Tool` (a name, a description, a JSON Schema for its arguments and
-a plain function that returns a short text for the model) and register it::
-
-    def get_time() -> str:
-        return time.strftime("%H:%M")
-
-    registry = ToolRegistry()
-    registry.register(
-        Tool("get_time", "Current local time.", {"type": "object", "properties": {}}, get_time)
-    )
-    assistant = Assistant(client, system_prompt, tools=registry)
+Tools are given as a :class:`~herald.tools.registry.ToolRegistry`, usually built by
+``herald.tools.load_tools`` from functions marked with ``@tool``. To add one, see ``herald.tools``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import re
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from herald.errors import OllamaError
 from herald.llm.ollama_client import ChatReply, Message, ToolCall
+from herald.tools.registry import Tool, ToolRegistry
+
+__all__ = ["Assistant", "ChatBackend", "Tool", "ToolRegistry"]  # Tool, ToolRegistry: re-exported
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +27,11 @@ logger = logging.getLogger(__name__)
 _GIVE_UP_REPLY = "Sorry, I could not finish that."
 # Spoken when tools ran but the model then said nothing: the action happened, so say so.
 _DONE_REPLY = "Done."
+# Spoken when the model wrote a call to a tool that does not exist (see `_inline_tool_call`).
+_CANNOT_REPLY = "Sorry, I could not do that."
 
-# Longest tool result (in characters) that is passed back to the model.
-_MAX_RESULT_CHARS = 2000
-
-# JSON Schema type names that `_check_arguments` knows how to check.
-_JSON_TYPES: dict[str, tuple[type, ...]] = {
-    "string": (str,),
-    "integer": (int,),
-    "number": (int, float),
-    "boolean": (bool,),
-    "array": (list,),
-    "object": (dict,),
-}
+# A reply that is nothing but a fenced block: ```json ... ```
+_FENCED = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 
 class ChatBackend(Protocol):
@@ -55,108 +42,19 @@ class ChatBackend(Protocol):
     ) -> ChatReply: ...
 
 
-@dataclass(frozen=True)
-class Tool:
-    """A function the model may call.
-
-    The handler receives arguments written by the model, so treat them as untrusted input. The
-    registry checks them against ``parameters`` first (required names, no unknown names unless
-    ``additionalProperties`` is true, and the basic types), but not their values: a handler must
-    still validate ranges and must never pass them to a shell, ``eval`` or an arbitrary file path.
-    Whatever it returns is cut to 2000 characters before the model sees it.
-    """
-
-    name: str
-    description: str
-    parameters: dict[str, Any]  # JSON Schema: {"type": "object", "properties": {...}, ...}
-    handler: Callable[..., str]  # called with the model's arguments as keywords
-
-    def schema(self) -> dict[str, Any]:
-        """The Ollama (OpenAI-style) function schema sent to the model."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
-
-
-class ToolRegistry:
-    """The tools an :class:`Assistant` offers to the model. Empty means no tools."""
-
-    def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
-
-    def __len__(self) -> int:
-        return len(self._tools)
-
-    def register(self, tool: Tool) -> None:
-        if tool.name in self._tools:
-            raise ValueError(f"Tool {tool.name!r} is already registered")
-        self._tools[tool.name] = tool
-
-    def schemas(self) -> list[dict[str, Any]]:
-        return [tool.schema() for tool in self._tools.values()]
-
-    def call(self, call: ToolCall) -> str:
-        """Run a tool call and return its result text (at most ~2000 characters).
-
-        Never raises: an unknown tool, invalid arguments or a failing handler come back as an
-        ``error: ...`` text, which the model can read and recover from.
-        """
-        text = self._run(call)
-        return text if len(text) <= _MAX_RESULT_CHARS else text[:_MAX_RESULT_CHARS] + "…"
-
-    def _run(self, call: ToolCall) -> str:
-        tool = self._tools.get(call.name)
-        if tool is None:
-            return _tool_error(f"unknown tool {call.name!r}")
-        problem = _check_arguments(tool.parameters, call.arguments)
-        if problem:
-            return _tool_error(f"invalid arguments for {call.name}: {problem}")
-        try:
-            return str(tool.handler(**call.arguments))
-        except Exception as exc:  # any handler failure goes back to the model
-            return _tool_error(f"{call.name} failed: {type(exc).__name__}: {exc}")
-
-
-def _tool_error(message: str) -> str:
-    logger.warning("Tool call failed: %s", message)
-    return f"error: {message}"
-
-
-def _check_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:
-    """Say what is wrong with ``arguments`` compared to the JSON ``schema``, or return None.
-
-    A deliberately small subset of JSON Schema. Unlike the standard, unknown names are rejected
-    unless the schema says ``"additionalProperties": true``.
-    """
-    properties = schema.get("properties", {})
-    missing = [name for name in schema.get("required", []) if name not in arguments]
-    if missing:
-        return "missing " + ", ".join(missing)
-    if not schema.get("additionalProperties", False):
-        unknown = [name for name in arguments if name not in properties]
-        if unknown:
-            return "unknown " + ", ".join(unknown)
-    for name, value in arguments.items():
-        expected = properties.get(name, {}).get("type")
-        if isinstance(expected, str) and expected in _JSON_TYPES:
-            # bool is a subclass of int in Python, but true is not a number in JSON.
-            is_bool = isinstance(value, bool)
-            if not isinstance(value, _JSON_TYPES[expected]) or (is_bool and expected != "boolean"):
-                return f"{name} must be of type {expected}"
-    return None
-
-
 class Assistant:
     """Keeps the conversation and turns a user message into the text to speak.
 
     ``history_turns`` is how many past exchanges (user message + final answer) are sent to the
     model with each message; 0 means no memory. ``max_tool_steps`` is how many rounds of tool
     calls are run for one message before giving up, so a confused model cannot loop forever.
+
+    ``use_triggers`` decides which tools the model is offered for a message. A tool with
+    ``triggers`` (see :class:`~herald.tools.registry.Tool`) is only offered when the user's message
+    contains one of them, and a message that matches none is plain chat, with no tools at all.
+    This is deterministic on purpose: small models call any tool they are offered on almost every
+    message. The tools offered are fixed once per message and refused afterwards if the model
+    calls another one. With ``use_triggers=False`` every tool is offered every time.
 
     Not thread-safe: use one ``Assistant`` per conversation (a server would need one per client).
     """
@@ -169,6 +67,7 @@ class Assistant:
         tools: ToolRegistry | None = None,
         history_turns: int = 10,
         max_tool_steps: int = 4,
+        use_triggers: bool = True,
     ) -> None:
         self._llm = llm
         self._system: Message = {"role": "system", "content": system_prompt}
@@ -176,6 +75,7 @@ class Assistant:
         self._tools = ToolRegistry() if tools is None else tools
         self._history_turns = history_turns
         self._max_tool_steps = max_tool_steps
+        self._use_triggers = use_triggers
         self._history: list[Message] = []
 
     @property
@@ -194,20 +94,29 @@ class Assistant:
         remembered, so the caller can report the error and carry on. The same goes for an empty
         answer when no tool ran. If tools did run, the turn is always kept and answered (with
         "Done." if the model says nothing), because asking again would repeat their effects.
+
+        Small models sometimes write a tool call as plain text, e.g.
+        ``{"name": "set_timer", "parameters": {...}}``, instead of calling the tool properly. When
+        tools are registered such a reply is run like a real call, or, if the tool does not exist
+        or was not offered for this message, dropped instead of being read aloud (answering
+        "Sorry, I could not do that.").
         """
         user: Message = {"role": "user", "content": user_text}
         messages: list[Message] = [self._system, *self._history, user]
-        schemas = self._tools.schemas() or None
+        # Decided once, from the user's message, and kept for every step of this turn.
+        trigger_text = user_text if self._use_triggers else None
+        offered = frozenset(self._tools.matching(trigger_text))
+        schemas = self._tools.schemas(trigger_text) or None
 
-        reply = self._llm.chat_messages(messages, tools=schemas)
+        reply, dropped = self._ask(messages, schemas, offered)
         spoken = reply.content
         ran_tools = False
         for _ in range(self._max_tool_steps):
             if not reply.tool_calls:
                 break
-            messages = self._run_tools(messages, reply)
+            messages = self._run_tools(messages, reply, offered)
             ran_tools = True
-            reply = self._llm.chat_messages(messages, tools=schemas)
+            reply, dropped = self._ask(messages, schemas, offered)
             spoken = reply.content or spoken
         if reply.tool_calls:
             logger.warning("Giving up after %d rounds of tool calls", self._max_tool_steps)
@@ -218,13 +127,43 @@ class Assistant:
             text = _GIVE_UP_REPLY
         elif ran_tools:
             text = _DONE_REPLY
+        elif dropped:
+            text = _CANNOT_REPLY
         else:
             raise OllamaError("The model returned an empty reply")
         self._remember(user, {"role": "assistant", "content": text})
         return text
 
-    def _run_tools(self, messages: list[Message], reply: ChatReply) -> list[Message]:
+    def _ask(
+        self,
+        messages: list[Message],
+        schemas: list[dict[str, Any]] | None,
+        offered: frozenset[str],
+    ) -> tuple[ChatReply, bool]:
+        """Ask the model and repair a tool call it wrote as text; see :meth:`respond`.
+
+        Returns the reply and whether a call to an unknown or not offered tool was dropped from it
+        (the reply then has no content). Only done when tools are registered: without any, JSON
+        is an answer.
+        """
+        reply = self._llm.chat_messages(messages, tools=schemas)
+        if reply.tool_calls or not self._tools:
+            return reply, False
+        call = _inline_tool_call(reply.content)
+        if call is None:
+            return reply, False
+        if call.name in offered:
+            logger.debug("Read a tool call for %s written as text", call.name)
+            return ChatReply("", (call,)), False
+        logger.warning("Dropped a call to the unavailable tool %r written as text", call.name)
+        return ChatReply(""), True
+
+    def _run_tools(
+        self, messages: list[Message], reply: ChatReply, offered: frozenset[str]
+    ) -> list[Message]:
         """Return ``messages`` plus the model's tool request and the result of each call.
+
+        A call to a tool that was not offered for this message is refused like an unknown one.
 
         These extra messages only live for the current ``respond`` call, not in the history.
         """
@@ -237,7 +176,7 @@ class Assistant:
             ],
         }
         results: list[Message] = [
-            {"role": "tool", "tool_name": call.name, "content": self._tools.call(call)}
+            {"role": "tool", "tool_name": call.name, "content": self._tools.call(call, offered)}
             for call in reply.tool_calls
         ]
         return [*messages, request, *results]
@@ -245,3 +184,26 @@ class Assistant:
     def _remember(self, *messages: Message) -> None:
         turns = self._history_turns
         self._history = [*self._history, *messages][-2 * turns :] if turns > 0 else []
+
+
+def _inline_tool_call(content: str) -> ToolCall | None:
+    """Read a reply that is only ``{"name": ..., "parameters": {...}}`` (optionally in a fence).
+
+    Anything else, such as prose that merely contains JSON, is not a tool call: return ``None``.
+    """
+    text = content.strip()
+    fenced = _FENCED.fullmatch(text)
+    if fenced:
+        text = fenced[1]
+    if not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+        return None
+    for key in ("parameters", "arguments"):
+        if isinstance(data.get(key), dict):
+            return ToolCall(data["name"], data[key])
+    return None

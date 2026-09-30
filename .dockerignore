@@ -5,6 +5,7 @@ dataset/
 models/
 runs/
 output/
+tools/
 **/*.pth
 **/*.wav
 
