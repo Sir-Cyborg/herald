@@ -69,6 +69,19 @@ class TestSlimCheckpoint:
             assert slimmed["model"][key].dtype == tensor.dtype
             assert torch.equal(slimmed["model"][key], tensor)
 
+    def test_nan_weights_are_copied_and_verified(self, torch, tmp_path):
+        state = make_state(torch)
+        state["model"]["gpt.weight"][0, 0] = float("nan")
+        path = tmp_path / "nan.pth"
+        torch.save(state, path)
+
+        result = slim.slim_checkpoint(path)
+
+        slimmed = load(torch, result.path)["model"]["gpt.weight"]
+        assert slimmed[0, 0].isnan() and torch.equal(
+            slimmed.isnan(), state["model"]["gpt.weight"].isnan()
+        )
+
     def test_the_slim_file_is_smaller_and_the_source_is_untouched(self, torch, checkpoint):
         before = checkpoint.read_bytes()
 
@@ -207,7 +220,29 @@ class TestFailures:
         assert files_in(checkpoint.parent) == ["best_model.pth"]
         assert checkpoint.read_bytes() == before
 
-    def test_a_slim_file_with_missing_weights_is_never_used(self, torch, checkpoint, monkeypatch):
+    @pytest.mark.parametrize("replace", [False, True])
+    def test_a_slim_file_with_a_changed_value_is_never_used(
+        self, torch, checkpoint, monkeypatch, replace
+    ):
+        before = checkpoint.read_bytes()
+        real_save = torch.save
+
+        def corrupting_save(obj, path, *args, **kwargs):  # one bit-flip in a single weight
+            model = dict(obj["model"])
+            weights = model["gpt.weight"].clone()
+            weights[3, 4] += 1e-3
+            model["gpt.weight"] = weights
+            real_save({"model": model}, path, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "save", corrupting_save)
+
+        with pytest.raises(CheckpointError, match="'gpt.weight' differs"):
+            slim.slim_checkpoint(checkpoint, replace=replace)
+
+        assert files_in(checkpoint.parent) == ["best_model.pth"]
+        assert checkpoint.read_bytes() == before
+
+    def test_a_slim_file_with_a_missing_weight_is_never_used(self, torch, checkpoint, monkeypatch):
         real_save = torch.save
 
         def truncated_save(obj, path, *args, **kwargs):

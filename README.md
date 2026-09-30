@@ -7,6 +7,7 @@ dataset, and talk to it: `herald chat` sends what you type to a local LLM
 ```
 herald synthesize             speak a text to a WAV file (base or fine-tuned voice)
 herald train                  fine-tune XTTS-v2 on a dataset
+herald slim                   shrink a trained voice to a third of its size
 herald chat                   chat with an Ollama model and hear the answers
 herald download-checkpoints   fetch the base XTTS-v2 weights (about 2 GB)
 ```
@@ -117,7 +118,7 @@ docker compose build
 docker compose run --rm herald download-checkpoints   # base weights into ./models/xtts_v2
 docker compose run --rm herald synthesize "Hello." --reference-wav dataset/my_voice.wav \
     -o output/hello.wav
-docker compose run --rm herald chat --no-play          # needs the ollama service (see below)
+docker compose run --rm herald chat --no-play          # text only; needs the ollama service (see below)
 ```
 
 Only `chat` needs Ollama:
@@ -156,8 +157,8 @@ docker compose exec ollama ollama pull llama3.2:3b
 > **macOS note.** Docker Desktop runs containers in a Linux VM with **no GPU passthrough and no
 > audio device**. Synthesis there is CPU-only, and training is CPU-only in a VM with limited
 > memory. For training and for speed, run natively. `herald chat` in a container cannot play
-> sound: use `--no-play` and open the WAV files it saves in `output/chat/`, or run `chat`
-> natively (it can still talk to the Ollama container).
+> sound: add `--no-play --save-dir output/chat` and open the WAV files it saves there, or run
+> `chat` natively (it can still talk to the Ollama container).
 
 ## Project layout
 
@@ -267,7 +268,9 @@ adapts the voice without wrecking what the model already knows.
 - Time and hardware. On the original run, 51 minutes of speech (1,299 clips) took about an hour
   and a half for 5 epochs on a Mac (the trainer has no Apple MPS support there). A CUDA GPU is
   much faster.
-- Free disk while it runs (the trainer writes large checkpoints; see the disk note below).
+- Free disk: about **22 GB** while it runs (the trainer keeps several 5.6 GB checkpoints at a
+  time; an estimate from the trainer's code, not a measurement), and about 2 GB per voice once
+  it is done.
 - The base weights: `train` downloads them by itself the first time.
 
 Check the dataset and the resolved settings first; this needs no GPU and loads no model:
@@ -302,11 +305,28 @@ default to the dataset directory name.
   command prints the exact `synthesize` command to use it.
 - **A model in `models/` is never overwritten or deleted.** If `models/<speaker>/` already
   holds a model, it is renamed `best_model.<date>-<time>.pth` (with its config) before the new
-  one moves in. These backups are 5.6 GB each: delete the ones you do not need.
+  one moves in. These backups are big: delete the ones you do not need.
 - **`--smoke` never touches your real voice.** A smoke run is a throwaway, so its model goes to
   `models/<speaker>_smoke/`.
-- **Disk.** The trainer also leaves checkpoint files (`checkpoint_<step>.pth`, about 5.6 GB
-  each) in `runs/<run>/`. Delete them once you are happy with the voice.
+- **The saved voice is slim, and the leftovers are deleted.** A training checkpoint weighs 5.6 GB
+  because it also carries the optimizer's state, which is only needed to *resume* training (Herald
+  does not do that). The model itself is about 2 GB. So `herald train` saves the slim version as
+  `models/<speaker>/best_model.pth`, then deletes the trainer's leftover checkpoint files from
+  `runs/<run>/` once the model is safe, and tells you how much space that freed. Pass
+  `--keep-checkpoints` to keep them.
+- **If you stop a run with Ctrl-C**, the trainer writes one last checkpoint and exits without
+  cleaning up. Nothing is promoted; turn what it left into a slim voice with
+  `herald slim runs/<run name>-<date>` and delete the rest of that folder yourself.
+
+**Shrinking a model you already have.**
+
+```bash
+herald slim models/frieren                 # writes models/frieren/best_model.slim.pth, keeps the original
+herald slim models/frieren --replace       # replaces best_model.pth with the slim one (checked first)
+```
+
+A slim file loads and sounds exactly like the full one, and is much easier to share. `herald slim`
+only accepts checkpoints you trust: they are Python pickles (see the security note).
 
 ### Chat
 
@@ -315,10 +335,17 @@ ollama pull llama3.2:3b
 herald chat
 ```
 
-Type a message, get a reply, and hear it. An empty line or Ctrl-D quits. Replies are also saved
-as WAV files in `output/chat/`. Playback is best effort and never required (`afplay` on macOS,
-`winsound` on Windows, a few common players on Linux); `--no-play` turns it off. If a reply
-cannot be spoken, the error is printed and the conversation continues.
+Type a message, get a reply, and hear it. An empty line or Ctrl-D quits. Replies are played
+and then **discarded**, so a long conversation does not fill the disk. Playback is best effort
+(`afplay` on macOS, `winsound` on Windows, a few common players on Linux). If a reply cannot be
+spoken, the error is printed and the conversation continues.
+
+| You want | Use |
+| --- | --- |
+| To hear the replies (default) | `herald chat` |
+| To hear them **and** keep them | `herald chat --save-dir replies/` (one WAV per reply) |
+| Only to save them, without playing (for example in Docker) | `herald chat --no-play --save-dir replies/` |
+| A text-only chat, no voice model loaded | `herald chat --no-play` |
 
 The character is set by the system prompt (`--system-prompt`, `--system-prompt-file` or
 `HERALD_SYSTEM_PROMPT`); the built-in one is Frieren. `--history N` controls how many past

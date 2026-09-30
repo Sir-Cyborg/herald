@@ -24,6 +24,15 @@ from types import SimpleNamespace
 from typing import Any
 
 from herald.config import DEFAULT_CHECKPOINT_URL
+from herald.dataset.audio_stats import (
+    MAX_CLIP_SECONDS,
+    MAX_WAV_SAMPLES,
+    MIN_CLIP_SECONDS,
+    MIN_CONDITIONING_SECONDS,
+    SAMPLE_RATE_TRAIN,
+    AudioStats,
+    inspect_audio,
+)
 from herald.dataset.metadata import (
     METADATA_FILE,
     MetadataItem,
@@ -48,6 +57,7 @@ DEFAULT_EVAL_FRACTION = 0.1
 DEFAULT_SEED = 42
 BEST_MODEL_NAME = "best_model.pth"
 CONFIG_NAME = "config.json"
+MAX_TEXT_LENGTH = 200  # transcripts longer than this many tokens are skipped by the trainer
 
 # "full" is the configuration of the original full run; "smoke" the quick sanity run
 # (a few dozen samples, one epoch) used to check that training does not crash.
@@ -213,12 +223,58 @@ class DatasetReport:
     train_rows: int
     eval_rows: int
     missing_audio: tuple[str, ...]  # of those rows, sorted
+    audio: AudioStats | None = None  # header statistics of those rows' audio files
+    # Rows whose transcript is longer than MAX_TEXT_LENGTH characters. The trainer limit is
+    # in tokens (about one per character or fewer), so these *may* be skipped.
+    long_text_rows: int = 0
+
+    def warnings(self) -> list[str]:
+        """One line per kind of row the trainer would skip or learn little from."""
+        lines = []
+        audio = self.audio
+        if audio is not None:
+            if audio.unreadable:
+                lines.append(
+                    f"{len(audio.unreadable)} audio file(s) are not WAV files that can be "
+                    f"inspected, so they are not checked{_examples(audio.unreadable)}"
+                )
+            if audio.too_short:
+                lines.append(
+                    f"{len(audio.too_short)} clip(s) are shorter than {MIN_CLIP_SECONDS:g} s: "
+                    f"the trainer skips them{_examples(audio.too_short)}"
+                )
+            if audio.too_long:
+                lines.append(
+                    f"{len(audio.too_long)} clip(s) are longer than {MAX_CLIP_SECONDS:.1f} s: "
+                    f"the trainer skips them{_examples(audio.too_long)}"
+                )
+            if audio.weak_reference:
+                lines.append(
+                    f"{audio.weak_reference} clip(s) are shorter than "
+                    f"{MIN_CONDITIONING_SECONDS:g} s: usable, but they teach the voice less"
+                )
+        if self.long_text_rows:
+            lines.append(
+                f"{self.long_text_rows} transcript(s) are longer than {MAX_TEXT_LENGTH} "
+                "characters: the trainer may skip them"
+            )
+        return lines
 
 
-def _select_rows(
-    params: TrainParams,
-) -> tuple[list[MetadataItem], list[MetadataItem], tuple[str, ...]]:
-    """The train and eval rows a run uses, and those among them whose audio is missing.
+def _examples(names: Sequence[str], limit: int = 3) -> str:
+    return f" (e.g. {', '.join(names[:limit])})"
+
+
+@dataclass(frozen=True)
+class _Selection:
+    train: list[MetadataItem]
+    eval: list[MetadataItem]
+    audio_paths: list[Path]  # the audio files of those rows that exist
+    missing: tuple[str, ...]  # audio files of those rows that do not exist, sorted
+
+
+def _select_rows(params: TrainParams) -> _Selection:
+    """The train and eval rows a run uses, and where their audio is.
 
     Reads the metadata file, splits it and then applies ``max_train_samples`` /
     ``max_eval_samples`` (the smoke preset), so eval never overlaps train.
@@ -231,19 +287,34 @@ def _select_rows(
     train_items = train_items[: params.max_train_samples]
     eval_items = eval_items[: params.max_eval_samples]
 
-    missing = []
+    audio_paths: list[Path] = []
+    missing: list[str] = []
     for item in [*train_items, *eval_items]:
         try:
-            resolve_audio_path(item["audio_file"], params.dataset_dir)
+            audio_paths.append(resolve_audio_path(item["audio_file"], params.dataset_dir))
         except FileNotFoundError:
             missing.append(item["audio_file"])
-    return train_items, eval_items, tuple(sorted(missing))
+    return _Selection(train_items, eval_items, audio_paths, tuple(sorted(missing)))
+
+
+def _report(params: TrainParams, rows: _Selection) -> DatasetReport:
+    long_text = sum(len(item["text"]) > MAX_TEXT_LENGTH for item in [*rows.train, *rows.eval])
+    return DatasetReport(
+        train_rows=len(rows.train),
+        eval_rows=len(rows.eval),
+        missing_audio=rows.missing,
+        audio=inspect_audio(rows.audio_paths, root=params.dataset_dir.resolve()),
+        long_text_rows=long_text,
+    )
 
 
 def validate_dataset(params: TrainParams) -> DatasetReport:
-    """Check the rows :func:`run_training` would use: how many, and that their audio exists."""
-    train_items, eval_items, missing = _select_rows(params)
-    return DatasetReport(len(train_items), len(eval_items), missing)
+    """Check the rows :func:`run_training` would use.
+
+    Reports how many there are, which audio files are missing and how the clips and
+    transcripts compare with what the trainer accepts (see :meth:`DatasetReport.warnings`).
+    """
+    return _report(params, _select_rows(params))
 
 
 def build_samples(items: Sequence[MetadataItem], params: TrainParams) -> list[dict[str, Any]]:
@@ -278,9 +349,9 @@ def model_args_kwargs(checkpoint_dir: Path) -> dict[str, Any]:
     checkpoint_dir = Path(checkpoint_dir)
     return {
         "max_conditioning_length": 132_300,  # 6 s at 22.05 kHz
-        "min_conditioning_length": 66_150,  # 3 s
-        "max_wav_length": 255_995,  # ~11.6 s
-        "max_text_length": 200,
+        "min_conditioning_length": int(MIN_CONDITIONING_SECONDS * SAMPLE_RATE_TRAIN),
+        "max_wav_length": MAX_WAV_SAMPLES,  # ~11.6 s
+        "max_text_length": MAX_TEXT_LENGTH,
         "mel_norm_file": str(checkpoint_dir / "mel_stats.pth"),
         "dvae_checkpoint": str(checkpoint_dir / "dvae.pth"),
         "xtts_checkpoint": str(checkpoint_dir / "model.pth"),
@@ -294,8 +365,8 @@ def model_args_kwargs(checkpoint_dir: Path) -> dict[str, Any]:
 
 
 AUDIO_CONFIG_KWARGS = {
-    "sample_rate": 22_050,
-    "dvae_sample_rate": 22_050,
+    "sample_rate": SAMPLE_RATE_TRAIN,
+    "dvae_sample_rate": SAMPLE_RATE_TRAIN,
     "output_sample_rate": 24_000,
 }
 
@@ -509,15 +580,17 @@ def run_training(params: TrainParams) -> TrainResult:
     Unless ``params.keep_checkpoints`` is set, the checkpoints of the run are deleted once the
     model is safely in place (never when no model was promoted).
     """
-    train_items, eval_items, missing = _select_rows(params)
-    if missing:
-        sample = ", ".join(missing[:5])
+    rows = _select_rows(params)
+    if rows.missing:
+        sample = ", ".join(rows.missing[:5])
         raise MetadataError(
-            f"{len(missing)} audio file(s) referenced by the metadata are missing "
+            f"{len(rows.missing)} audio file(s) referenced by the metadata are missing "
             f"from {params.dataset_dir} (e.g. {sample})"
         )
-    train_samples = build_samples(train_items, params)
-    eval_samples = build_samples(eval_items, params)
+    for line in _report(params, rows).warnings():
+        logger.warning("Dataset: %s", line)
+    train_samples = build_samples(rows.train, params)
+    eval_samples = build_samples(rows.eval, params)
     logger.info("train samples: %d, eval samples: %d", len(train_samples), len(eval_samples))
     if not eval_samples:
         logger.warning("No eval samples: the best model is picked by training loss")

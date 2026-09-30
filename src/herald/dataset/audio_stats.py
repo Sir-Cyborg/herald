@@ -74,7 +74,11 @@ def inspect_audio(
         label = str(path.relative_to(root)) if root and path.is_relative_to(root) else str(path)
         try:
             with wave.open(str(path), "rb") as clip:
-                rate, n_channels, frames = clip.getframerate(), clip.getnchannels(), clip.getnframes()
+                rate, n_channels, frames = (
+                    clip.getframerate(),
+                    clip.getnchannels(),
+                    clip.getnframes(),
+                )
         except (wave.Error, EOFError, OSError) as exc:
             logger.debug("%s: not inspected (%s)", path, exc)
             unreadable.append(label)

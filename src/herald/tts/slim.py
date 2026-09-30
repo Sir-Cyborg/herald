@@ -63,8 +63,18 @@ def _tensor_bytes(torch: Any, state_dict: dict[str, Any]) -> int:
     return sum(t.numel() * t.element_size() for t in state_dict.values() if torch.is_tensor(t))
 
 
+def _same_tensor(torch: Any, a: Any, b: Any) -> bool:
+    """Same shape, dtype and values, compared bit for bit (so a NaN equals itself)."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
+
+
 def _verify(torch: Any, path: Path, model: dict[str, Any]) -> None:
-    """Reload ``path`` and check it holds exactly ``model``'s keys, shapes and dtypes."""
+    """Reload ``path`` and check it holds exactly ``model``: same keys, shapes, dtypes, values.
+
+    Both sides are memory-mapped, so this reads the model part of the checkpoint twice.
+    """
     saved = _load(torch, path)
     if (
         not isinstance(saved, dict)
@@ -78,11 +88,7 @@ def _verify(torch: Any, path: Path, model: dict[str, Any]) -> None:
     for key, tensor in model.items():
         other = saved_model[key]
         if torch.is_tensor(tensor):
-            same = (
-                torch.is_tensor(other)
-                and other.shape == tensor.shape
-                and other.dtype == tensor.dtype
-            )
+            same = torch.is_tensor(other) and _same_tensor(torch, tensor, other)
         else:
             same = type(other) is type(tensor)
         if not same:
@@ -97,9 +103,10 @@ def slim_checkpoint(source: Path, dest: Path | None = None, *, replace: bool = F
     instead, and ``dest`` must not be given. A checkpoint that already holds nothing but
     ``"model"`` is left alone (``already_slim``, nothing is written).
 
-    The slim file is written to ``<dest>.part``, reloaded and compared (same keys, shapes and
-    dtypes) and only then renamed into place, so an interrupted or failed run leaves no
-    partial file and ``source`` is never touched unless the verified replacement is done.
+    The slim file is written to ``<dest>.part``, reloaded and compared (same keys, shapes,
+    dtypes and values) and only then renamed into place, so an interrupted or failed run
+    leaves no partial file and ``source`` is never touched unless the verified replacement
+    is done.
     Raises :class:`CheckpointError` if ``source`` is not a coqui checkpoint or the disk is
     clearly too small.
 

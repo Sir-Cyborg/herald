@@ -7,12 +7,14 @@ import inspect
 import logging
 import sys
 import types
+import wave
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from herald.config import DEFAULT_CHECKPOINT_URL
+from herald.dataset.audio_stats import AudioStats
 from herald.dataset.metadata import METADATA_FILE, load_metadata, split_items
 from herald.errors import CheckpointError, ConfigError, MetadataError
 from herald.tts import slim, train
@@ -27,6 +29,14 @@ def write_dataset(root: Path, clips: int) -> Path:
         lines.append(f"audio/{i:06d}.wav|Sentence number {i}, with a comma.")
     (root / METADATA_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return root
+
+
+def write_wav(path: Path, seconds: float, *, rate: int = 22_050, channels: int = 1) -> None:
+    with wave.open(str(path), "wb") as clip:
+        clip.setnchannels(channels)
+        clip.setsampwidth(2)
+        clip.setframerate(rate)
+        clip.writeframes(b"\x00\x00" * channels * round(seconds * rate))
 
 
 @pytest.fixture
@@ -238,6 +248,131 @@ class TestValidateDataset:
             train.validate_dataset(params_for(train_dataset, tmp_path))
 
 
+class TestDatasetAudioReport:
+    @pytest.fixture
+    def wav_dataset(self, train_dataset) -> Path:
+        """20 real WAV clips: 17 good ones and a too short, a too long and a short-ish one."""
+        for i in range(20):
+            write_wav(train_dataset / "audio" / f"{i:06d}.wav", 4)
+        write_wav(train_dataset / "audio" / "000000.wav", 0.3)
+        write_wav(train_dataset / "audio" / "000001.wav", 12)
+        write_wav(train_dataset / "audio" / "000002.wav", 2, rate=44_100, channels=2)
+        return train_dataset
+
+    def test_reports_what_the_trainer_would_skip(self, wav_dataset, tmp_path):
+        report = train.validate_dataset(params_for(wav_dataset, tmp_path))
+
+        audio = report.audio
+        assert audio is not None
+        assert audio.clips_checked == 20
+        assert audio.too_short == ("audio/000000.wav",)  # relative to the dataset
+        assert audio.too_long == ("audio/000001.wav",)
+        assert audio.weak_reference == 1
+        assert audio.sample_rates == {22_050: 19, 44_100: 1}
+        assert audio.channels == {1: 19, 2: 1}
+        assert audio.total_seconds == pytest.approx(17 * 4 + 0.3 + 12 + 2)
+        assert (report.train_rows, report.eval_rows, report.missing_audio) == (18, 2, ())
+
+    def test_only_the_rows_a_smoke_run_uses_are_inspected(self, big_dataset, tmp_path):
+        # The clips of big_dataset are not WAV files, so each inspected clip is "unreadable".
+        report = train.validate_dataset(params_for(big_dataset, tmp_path, preset="smoke"))
+
+        assert report.audio is not None
+        assert len(report.audio.unreadable) == report.train_rows + report.eval_rows == 70
+
+    def test_missing_files_are_not_counted_as_unreadable(self, train_dataset, tmp_path):
+        (train_dataset / "audio" / "000005.wav").unlink()
+
+        report = train.validate_dataset(params_for(train_dataset, tmp_path))
+
+        assert report.missing_audio == ("audio/000005.wav",)
+        assert report.audio is not None and len(report.audio.unreadable) == 19
+
+    def test_counts_transcripts_that_may_be_too_long(self, train_dataset, tmp_path):
+        rows = [f"audio/{i:06d}.wav|{'a' * n}" for i, n in enumerate([200, 201, 500, 10])]
+        (train_dataset / METADATA_FILE).write_text("\n".join(rows) + "\n")
+
+        report = train.validate_dataset(params_for(train_dataset, tmp_path))
+
+        assert report.long_text_rows == 2
+
+    def test_long_transcripts_outside_the_used_rows_are_ignored(self, big_dataset, tmp_path):
+        params = params_for(big_dataset, tmp_path, preset="smoke")
+        items = load_metadata(big_dataset / METADATA_FILE)
+        train_rows, _ = split_items(items, 0.1, 42)
+        unused = train_rows[60]["audio_file"]  # the smoke preset trains on the first 60 only
+        rows = [
+            f"{i['audio_file']}|{'a' * 300 if i['audio_file'] == unused else 'ok'}" for i in items
+        ]
+        (big_dataset / METADATA_FILE).write_text("\n".join(rows) + "\n")
+
+        assert train.validate_dataset(params).long_text_rows == 0
+
+    def test_run_training_logs_the_warnings(
+        self, wav_dataset, tmp_path, monkeypatch, mocker, caplog
+    ):
+        run_dir = tmp_path / "runs" / "run"
+        stack = make_fake_stack([], run_dir)
+        monkeypatch.setattr(train, "_import_training_stack", lambda: stack)
+        monkeypatch.setattr(train.slim, "slim_checkpoint", fake_slim)
+        mocker.patch("herald.tts.checkpoints.ensure_base_checkpoints")
+
+        with caplog.at_level(logging.WARNING, logger="herald.tts.train"):
+            train.run_training(params_for(wav_dataset, tmp_path))
+
+        assert "1 clip(s) are shorter than 0.5 s" in caplog.text
+        assert "1 clip(s) are longer than 11.6 s" in caplog.text
+
+
+class TestDatasetReportWarnings:
+    def audio(self, **kwargs) -> AudioStats:
+        values = dict(
+            clips_checked=10,
+            unreadable=(),
+            total_seconds=60.0,
+            sample_rates={22_050: 10},
+            channels={1: 10},
+            too_short=(),
+            too_long=(),
+            weak_reference=0,
+        )
+        return AudioStats(**{**values, **kwargs})
+
+    def test_a_clean_dataset_has_no_warnings(self):
+        assert train.DatasetReport(9, 1, (), self.audio()).warnings() == []
+
+    def test_a_report_without_audio_statistics(self):
+        assert train.DatasetReport(9, 1, ()).warnings() == []
+        assert train.DatasetReport(9, 1, ()).audio is None
+        assert train.DatasetReport(9, 1, ()).long_text_rows == 0
+
+    def test_every_kind_of_problem_gets_a_line(self):
+        audio = self.audio(
+            unreadable=("a.flac",),
+            too_short=("s1.wav", "s2.wav"),
+            too_long=("l1.wav",),
+            weak_reference=4,
+        )
+
+        lines = train.DatasetReport(9, 1, (), audio, long_text_rows=3).warnings()
+
+        assert len(lines) == 5
+        joined = "\n".join(lines)
+        assert "1 audio file(s) are not WAV files" in joined
+        assert (
+            "2 clip(s) are shorter than 0.5 s: the trainer skips them (e.g. s1.wav, s2.wav)"
+            in joined
+        )
+        assert "1 clip(s) are longer than 11.6 s: the trainer skips them" in joined
+        assert "4 clip(s) are shorter than 3 s: usable, but they teach the voice less" in joined
+        assert "3 transcript(s) are longer than 200 characters: the trainer may skip them" in joined
+
+    def test_only_a_few_examples_are_listed(self):
+        audio = self.audio(too_short=tuple(f"{i}.wav" for i in range(10)))
+        (line,) = train.DatasetReport(9, 1, (), audio).warnings()
+        assert "10 clip(s)" in line and "(e.g. 0.wav, 1.wav, 2.wav)" in line
+
+
 class TestConfigKwargs:
     def test_trainer_config_for_the_full_preset(self, dataset_dir, tmp_path):
         kwargs = train.trainer_config_kwargs(params_for(dataset_dir, tmp_path))
@@ -264,6 +399,9 @@ class TestConfigKwargs:
         assert kwargs["mel_norm_file"] == str(tmp_path / "mel_stats.pth")
         assert kwargs["tokenizer_file"] == str(tmp_path / "vocab.json")
         assert kwargs["max_wav_length"] == 255_995
+        assert kwargs["min_conditioning_length"] == 66_150
+        assert kwargs["max_text_length"] == 200
+        assert train.AUDIO_CONFIG_KWARGS["sample_rate"] == 22_050
 
 
 class FrozenDatetime:

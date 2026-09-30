@@ -7,6 +7,7 @@ coqui-tts, numpy and requests are only imported inside the command handlers.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import itertools
 import logging
@@ -14,6 +15,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -277,9 +279,17 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         "--history", type=int, default=10, help="Past exchanges sent to the model (0: none)."
     )
     p.add_argument(
-        "--save-dir", type=Path, help="Where replies are saved. Default: <output dir>/chat."
+        "--save-dir",
+        type=Path,
+        help="Keep every reply as a WAV file in DIR. By default replies are played and then "
+        "discarded, so chat does not fill the disk.",
     )
-    p.add_argument("--no-play", action="store_true", help="Do not play the replies.")
+    p.add_argument(
+        "--no-play",
+        action="store_true",
+        help="Do not play the replies. Without --save-dir either, chat in text only "
+        "(the voice model is not even loaded).",
+    )
     p.set_defaults(func=_cmd_chat)
 
     # download-checkpoints
@@ -563,46 +573,83 @@ def _build_assistant(args: argparse.Namespace, settings: Settings):
     return Assistant(client, system_prompt, history_turns=args.history)
 
 
-def _cmd_chat(args: argparse.Namespace, settings: Settings) -> int:
+def _make_speaker(args: argparse.Namespace, settings: Settings, stack: contextlib.ExitStack):
+    """Load the voice and return ``say(text, turn)``, which speaks one chat reply.
+
+    Returns None for a text-only chat (``--no-play`` without ``--save-dir``): nothing would
+    be done with the audio, so the model is not loaded. Replies are kept in ``--save-dir``
+    when given; otherwise each one is written to a single scratch file, overwritten on every
+    turn and removed with its directory when ``stack`` closes, whatever ends the session.
+    """
+    if args.no_play and args.save_dir is None:
+        print(
+            "Audio is neither played nor saved (--no-play without --save-dir): chatting in "
+            "text only. Add --save-dir DIR to keep WAV files.",
+            file=sys.stderr,
+        )
+        return None
+
     from herald import audio_playback
-    from herald.errors import OllamaError
     from herald.tts import engine
 
-    assistant = _build_assistant(args, settings)
     eng = _load_engine(args, settings)
-
-    save_dir = args.save_dir or settings.output_dir / "chat"
+    folder = args.save_dir or Path(
+        stack.enter_context(tempfile.TemporaryDirectory(prefix="herald-chat-"))
+    )
     session = time.strftime("%Y%m%d_%H%M%S")
     warned_no_player = False
 
-    print("Type a message; an empty line or Ctrl-D quits.")
-    for turn in itertools.count(1):
-        try:
-            user_text = input("You: ").strip()
-        except EOFError:
-            break
-        if not user_text:
-            break
-
-        try:
-            reply = assistant.respond(user_text)
-        except OllamaError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            continue
-        print(f"Herald: {reply}")
-
-        try:
-            wav = eng.synth_long(reply, pause_ms=args.pause_ms, max_chars=args.max_chars)
-            path = engine.save_wav(
-                save_dir / f"chat_{session}_{turn:03d}.wav", wav, eng.sample_rate
-            )
-        except Exception as exc:  # one failed reply must not end the conversation
-            logger.debug("Speech synthesis failed", exc_info=True)
-            print(f"error: could not speak the reply: {exc}", file=sys.stderr)
-            continue
+    def say(text: str, turn: int) -> None:
+        nonlocal warned_no_player
+        wav = eng.synth_long(text, pause_ms=args.pause_ms, max_chars=args.max_chars)
+        # Saved replies are numbered; a scratch reply reuses one name, so only one is on disk.
+        name = f"chat_{session}_{turn:03d}.wav" if args.save_dir else "reply.wav"
+        path = engine.save_wav(folder / name, wav, eng.sample_rate)
         if not args.no_play and not audio_playback.play_wav(path) and not warned_no_player:
-            print(f"No audio player available; replies are saved in {save_dir}", file=sys.stderr)
             warned_no_player = True
+            print(
+                "No audio player available; "
+                + (
+                    f"replies are saved in {args.save_dir}"
+                    if args.save_dir
+                    else "use --save-dir DIR to keep the replies as WAV files."
+                ),
+                file=sys.stderr,
+            )
+
+    return say
+
+
+def _cmd_chat(args: argparse.Namespace, settings: Settings) -> int:
+    from herald.errors import OllamaError
+
+    assistant = _build_assistant(args, settings)
+    with contextlib.ExitStack() as stack:
+        say = _make_speaker(args, settings, stack)
+
+        print("Type a message; an empty line or Ctrl-D quits.")
+        for turn in itertools.count(1):
+            try:
+                user_text = input("You: ").strip()
+            except EOFError:
+                break
+            if not user_text:
+                break
+
+            try:
+                reply = assistant.respond(user_text)
+            except OllamaError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                continue
+            print(f"Herald: {reply}")
+
+            if say is None:
+                continue
+            try:
+                say(reply, turn)
+            except Exception as exc:  # one failed reply must not end the conversation
+                logger.debug("Speech synthesis failed", exc_info=True)
+                print(f"error: could not speak the reply: {exc}", file=sys.stderr)
     return 0
 
 

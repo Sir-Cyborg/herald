@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -801,14 +802,20 @@ class TestChat:
 
         return feed
 
+    @pytest.fixture(autouse=True)
+    def scratch_root(self, tmp_path, monkeypatch):
+        """Where tempfile puts the chat's scratch directory, so that tests can look inside."""
+        root = tmp_path / "scratch"
+        root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(root))
+        return root
+
     def chat_args(self, dataset_dir, tmp_path, *extra):
-        return [
-            "chat",
-            *voice_args(dataset_dir, tmp_path),
-            "--save-dir",
-            str(tmp_path / "wavs"),
-            *extra,
-        ]
+        return ["chat", *voice_args(dataset_dir, tmp_path), *extra]
+
+    def keep(self, tmp_path):
+        """The option that keeps the replies, and the folder they end up in."""
+        return ["--save-dir", str(tmp_path / "wavs")]
 
     def test_conversation_loop(
         self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
@@ -816,7 +823,7 @@ class TestChat:
         play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
         typed("Hello", "Are you there?", "Still there?", "")
 
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        code, out, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
 
         assert code == 0
         assert len(assistant.created) == 1  # one conversation for the whole session
@@ -826,8 +833,104 @@ class TestChat:
         # Only the replies that arrived are spoken, saved and played.
         assert [c["text"] for c in fake_load.calls] == ["First reply.", "Third reply."]
         assert [c["max_chars"] for c in fake_load.calls] == [None, None]
+        saved = sorted((tmp_path / "wavs").glob("chat_*.wav"))
+        assert [p.name[-7:-4] for p in saved] == ["001", "003"]  # turn 2 had no reply
+        assert [c.args[0] for c in play.call_args_list] == saved
+
+    def test_replies_are_kept_only_with_save_dir(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
+    ):
+        mocker.patch("herald.audio_playback.play_wav", return_value=True)
+        typed("a", "b", "c")
+        run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
+        assert len(list((tmp_path / "wavs").iterdir())) == 2  # exactly one file per spoken reply
+        assert list(scratch_root.iterdir()) == []  # no scratch directory was needed
+
+    def test_replies_are_played_from_one_scratch_file_and_nothing_is_left(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
+    ):
+        played = []
+
+        def play(path):
+            played.append((path, sorted(p.name for p in path.parent.iterdir())))
+            return True
+
+        mocker.patch("herald.audio_playback.play_wav", side_effect=play)
+        typed("a", "b", "c")
+
+        code, out, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
+
+        assert code == 0
+        assert "Herald: First reply." in out and "Herald: Third reply." in out
+        (first, listing1), (second, listing2) = played
+        assert first == second  # every reply is written over the previous one
+        assert first.parent.parent == scratch_root
+        assert first.parent.name.startswith("herald-chat-")
+        assert listing1 == listing2 == [first.name]  # at most one reply is ever on disk
+        assert list(scratch_root.iterdir()) == []  # the scratch directory is gone
+        assert not (tmp_path / "project" / "output").exists()  # ...and nothing went to output/
+
+    def test_the_scratch_directory_is_removed_on_ctrl_c(
+        self, dataset_dir, tmp_path, fake_load, assistant, mocker, monkeypatch, scratch_root, capsys
+    ):
+        play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
+        lines = iter(["Hello"])
+
+        def input_then_interrupt(prompt=""):
+            try:
+                return next(lines)
+            except StopIteration:
+                raise KeyboardInterrupt from None
+
+        monkeypatch.setattr("builtins.input", input_then_interrupt)
+        code, _, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 130
+        assert play.call_count == 1  # a reply had been written to the scratch directory
+        assert list(scratch_root.iterdir()) == []
+
+    def test_the_scratch_directory_is_removed_after_a_failed_synthesis(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, scratch_root, capsys
+    ):
+        def broken(text, pause_ms, max_chars):
+            raise RuntimeError("model exploded")
+
+        fake_load.synth_long = broken
+        typed("a", "b", "c")
+        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        assert code == 0
+        assert err.count("could not speak the reply: model exploded") == 2
+        assert list(scratch_root.iterdir()) == []
+
+    def test_no_play_without_save_dir_is_a_text_only_chat(
+        self, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
+    ):
+        play = mocker.patch("herald.audio_playback.play_wav")
+        typed("a", "b", "c")
+
+        # No dataset, no weights: nothing is needed because nothing is spoken.
+        code, out, err = run(self.chat_args(tmp_path / "no_dataset", tmp_path, "--no-play"), capsys)
+
+        assert code == 0
+        assert "Herald: First reply." in out and "Herald: Third reply." in out
+        assert fake_load.load_calls == [] and fake_load.calls == []  # the model is never loaded
+        play.assert_not_called()
+        assert err.count("chatting in text only") == 1
+        assert "Audio is neither played nor saved (--no-play without --save-dir)" in err
+        assert "Add --save-dir DIR to keep WAV files." in err
+        assert list(scratch_root.iterdir()) == []
+
+    def test_no_play_with_save_dir_saves_without_playing(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
+    ):
+        play = mocker.patch("herald.audio_playback.play_wav")
+        typed("a", "b", "c")
+        args = self.chat_args(dataset_dir, tmp_path, "--no-play", *self.keep(tmp_path))
+        code, _, err = run(args, capsys)
+        assert code == 0
         assert len(list((tmp_path / "wavs").glob("chat_*.wav"))) == 2
-        assert play.call_count == 2
+        assert len(fake_load.load_calls) == 1
+        play.assert_not_called()
+        assert "text only" not in err
 
     def test_a_failed_synthesis_does_not_end_the_session(
         self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
@@ -843,7 +946,7 @@ class TestChat:
         fake_load.synth_long = flaky
         typed("one", "two", "three", "")
 
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
+        code, out, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
 
         assert code == 0
         assert "Herald: First reply." in out  # the text is shown even if it could not be spoken
@@ -938,14 +1041,6 @@ class TestChat:
         run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
         assert assistant.created[0]["history_turns"] == turns
 
-    def test_no_play_never_touches_the_player(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav")
-        typed("Hi")
-        run(self.chat_args(dataset_dir, tmp_path, "--no-play"), capsys)
-        play.assert_not_called()
-
     def test_missing_player_is_mentioned_once(
         self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
     ):
@@ -953,6 +1048,17 @@ class TestChat:
         typed("a", "b", "c")
         _, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
         assert err.count("No audio player available") == 1
+        # Nothing is kept, so it must not send the user looking for a folder of replies.
+        assert "use --save-dir DIR to keep the replies as WAV files" in err
+
+    def test_missing_player_with_save_dir_says_where_the_replies_are(
+        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
+    ):
+        mocker.patch("herald.audio_playback.play_wav", return_value=False)
+        typed("a", "b", "c")
+        _, _, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
+        assert err.count("No audio player available") == 1
+        assert f"replies are saved in {tmp_path / 'wavs'}" in err
 
     def test_ctrl_c_ends_the_session_quietly(
         self, dataset_dir, tmp_path, fake_load, assistant, monkeypatch, capsys
@@ -978,7 +1084,7 @@ class TestChat:
             side_effect=[answer("First."), requests.ConnectionError("down"), answer("Third.")],
         )
         typed("one", "two", "three")
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path, "--no-play"), capsys)
+        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
 
         assert code == 0
         assert "Herald: First." in out and "Herald: Third." in out
