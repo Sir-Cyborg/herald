@@ -1,7 +1,8 @@
 """Conversation logic: history, the system prompt and the tool-calling loop.
 
 This module knows nothing about the terminal or about speech. The CLI chat loop (and, later, any
-other front end) feeds it the user's text and speaks whatever ``Assistant.respond`` returns.
+other front end) feeds it the user's text and speaks whatever ``Assistant.respond`` returns, or,
+to start speaking before the model has finished, whatever it passes to ``on_text`` meanwhile.
 
 Tools are given as a :class:`~herald.tools.registry.ToolRegistry`, usually built by
 ``herald.tools.load_tools`` from functions marked with ``@tool``. To add one, see ``herald.tools``.
@@ -12,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from herald.errors import OllamaError
@@ -38,7 +39,11 @@ class ChatBackend(Protocol):
     """What :class:`Assistant` needs from an LLM client (``OllamaClient`` provides it)."""
 
     def chat_messages(
-        self, messages: Sequence[Message], tools: Sequence[dict[str, Any]] | None = None
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]] | None = None,
+        *,
+        on_delta: Callable[[str], None] | None = None,
     ) -> ChatReply: ...
 
 
@@ -87,8 +92,21 @@ class Assistant:
         """Forget the conversation."""
         self._history = []
 
-    def respond(self, user_text: str) -> str:
+    def respond(self, user_text: str, on_text: Callable[[str], None] | None = None) -> str:
         """Answer ``user_text``, running any tools the model asks for; return the text to speak.
+
+        ``on_text`` receives the answer as it becomes known, in one or several pieces whose
+        concatenation is exactly the returned text. For a plain chat message (no tool offered)
+        the pieces arrive while the model is still generating, which lets the caller start
+        speaking early. When tools are offered the model may answer with a tool call, or with
+        text that only looks like one, so nothing is passed on until the final answer is known;
+        then ``on_text`` gets it whole, once. A reply that starts like JSON (``{``) or a code
+        fence is held back the same way when tools are registered, so a tool call written as text
+        is never passed on. ``on_text`` is called on the calling thread. If an error is raised
+        half way (``OllamaError``), ``on_text`` may already have received part of the answer:
+        the caller should stop whatever it started (cancel the speech). An exception from
+        ``on_text`` itself propagates the same way; once the exchange is complete it is
+        remembered even if delivering the last piece fails.
 
         Exceptions from the LLM client (``OllamaError``) propagate, and the message is then not
         remembered, so the caller can report the error and carry on. The same goes for an empty
@@ -108,7 +126,11 @@ class Assistant:
         offered = frozenset(self._tools.matching(trigger_text))
         schemas = self._tools.schemas(trigger_text) or None
 
-        reply, dropped = self._ask(messages, schemas, offered)
+        # Stream only a plain chat turn: with tools on offer the reply may be a call, not speech.
+        sink = _TextSink(on_text, hold_json=bool(self._tools)) if on_text is not None else None
+        on_delta = sink.feed if sink is not None and not offered else None
+
+        reply, dropped = self._ask(messages, schemas, offered, on_delta)
         spoken = reply.content
         ran_tools = False
         for _ in range(self._max_tool_steps):
@@ -116,7 +138,7 @@ class Assistant:
                 break
             messages = self._run_tools(messages, reply, offered)
             ran_tools = True
-            reply, dropped = self._ask(messages, schemas, offered)
+            reply, dropped = self._ask(messages, schemas, offered, on_delta)
             spoken = reply.content or spoken
         if reply.tool_calls:
             logger.warning("Giving up after %d rounds of tool calls", self._max_tool_steps)
@@ -132,6 +154,8 @@ class Assistant:
         else:
             raise OllamaError("The model returned an empty reply")
         self._remember(user, {"role": "assistant", "content": text})
+        if sink is not None:
+            sink.finish(text)  # whatever the caller has not received yet, usually all of it or none
         return text
 
     def _ask(
@@ -139,6 +163,7 @@ class Assistant:
         messages: list[Message],
         schemas: list[dict[str, Any]] | None,
         offered: frozenset[str],
+        on_delta: Callable[[str], None] | None,
     ) -> tuple[ChatReply, bool]:
         """Ask the model and repair a tool call it wrote as text; see :meth:`respond`.
 
@@ -146,7 +171,10 @@ class Assistant:
         (the reply then has no content). Only done when tools are registered: without any, JSON
         is an answer.
         """
-        reply = self._llm.chat_messages(messages, tools=schemas)
+        if on_delta is None:  # plain call: backends that cannot stream need not know the keyword
+            reply = self._llm.chat_messages(messages, tools=schemas)
+        else:
+            reply = self._llm.chat_messages(messages, tools=schemas, on_delta=on_delta)
         if reply.tool_calls or not self._tools:
             return reply, False
         call = _inline_tool_call(reply.content)
@@ -184,6 +212,46 @@ class Assistant:
     def _remember(self, *messages: Message) -> None:
         turns = self._history_turns
         self._history = [*self._history, *messages][-2 * turns :] if turns > 0 else []
+
+
+class _TextSink:
+    """Hands text to the caller's ``on_text`` and remembers how much it has handed over.
+
+    ``feed`` takes the pieces of a streamed reply. With ``hold_json`` it keeps back a reply whose
+    first visible character is ``{`` or a backtick (a tool call written as text, which must not
+    be spoken, see :func:`_inline_tool_call`) and lets any other reply through at once.
+    ``finish`` then sends what the caller has not got yet: nothing for a reply that was streamed,
+    the whole text for one that was not.
+    """
+
+    def __init__(self, on_text: Callable[[str], None], *, hold_json: bool) -> None:
+        self._on_text = on_text
+        self._hold_json = hold_json
+        self._seen = ""  # everything fed before the first visible character
+        self._holding: bool | None = None  # None until the first visible character is known
+        self.delivered = ""
+
+    def feed(self, piece: str) -> None:
+        if self._holding is None:
+            self._seen += piece
+            visible = self._seen.lstrip()
+            if not visible:
+                return
+            self._holding = self._hold_json and visible[0] in "{`"
+            piece, self._seen = self._seen, ""
+        if not self._holding:
+            self._send(piece)
+
+    def finish(self, text: str) -> None:
+        if not text.startswith(self.delivered):
+            logger.warning("The streamed text differs from the final answer; not sending it again")
+            return
+        if len(text) > len(self.delivered):
+            self._send(text[len(self.delivered) :])
+
+    def _send(self, piece: str) -> None:
+        self._on_text(piece)
+        self.delivered += piece
 
 
 def _inline_tool_call(content: str) -> ToolCall | None:

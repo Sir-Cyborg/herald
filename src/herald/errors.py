@@ -21,6 +21,10 @@ class DependencyError(HeraldError):
     """The heavy TTS stack (torch, coqui-tts) is not importable."""
 
 
+class ProfileError(HeraldError):
+    """A voice profile is missing, malformed, or has an unknown or invalid setting."""
+
+
 class OllamaError(HeraldError):
     """The Ollama server is unreachable or returned an unusable answer."""
 

@@ -23,6 +23,8 @@ def test_defaults_live_under_the_project_root(tmp_path):
     assert s.runs_dir == root / "runs"
     assert s.output_dir == root / "output"
     assert s.tools_dir == root / "tools"
+    assert s.profiles_dir == root / "profiles"
+    assert s.profile is None
     assert s.device == "auto"
     assert s.language == "en"
     assert s.ollama_model == DEFAULT_OLLAMA_MODEL
@@ -39,6 +41,8 @@ def test_environment_overrides(tmp_path):
         "HERALD_RUNS_DIR": "/data/runs",
         "HERALD_OUTPUT_DIR": "/data/out",
         "HERALD_TOOLS_DIR": "/data/tools",
+        "HERALD_PROFILES_DIR": "/data/profiles",
+        "HERALD_PROFILE": "frieren",
         "HERALD_DEVICE": "cpu",
         "HERALD_LANGUAGE": "it",
         "HERALD_OLLAMA_URL": "http://ollama:11434",
@@ -55,6 +59,8 @@ def test_environment_overrides(tmp_path):
     assert s.runs_dir == Path("/data/runs")
     assert s.output_dir == Path("/data/out")
     assert s.tools_dir == Path("/data/tools")
+    assert s.profiles_dir == Path("/data/profiles")
+    assert s.profile == "frieren"
     assert (s.device, s.language) == ("cpu", "it")
     assert (s.ollama_url, s.ollama_model, s.ollama_timeout) == (
         "http://ollama:11434",
@@ -88,11 +94,15 @@ def test_empty_variable_counts_as_unset(tmp_path):
         "HERALD_CHECKPOINT_DIR": "",
         "HERALD_CHECKPOINT": "",
         "HERALD_TOOLS_DIR": "",
+        "HERALD_PROFILES_DIR": "",
+        "HERALD_PROFILE": "",
     }
     s = Settings.from_env(env)
     root = tmp_path.resolve()
     assert s.device == "auto"
     assert s.tools_dir == root / "tools"
+    assert s.profiles_dir == root / "profiles"
+    assert s.profile is None
     assert s.checkpoint_dir == root / "models" / "xtts_v2"
     assert s.checkpoint is None
 
@@ -104,9 +114,11 @@ def test_home_is_expanded(tmp_path):
         "HERALD_MODELS_DIR": "~/models",
         "HERALD_CHECKPOINT": "~/models/frieren",
         "HERALD_TOOLS_DIR": "~/my-tools",
+        "HERALD_PROFILES_DIR": "~/my-profiles",
     }
     s = Settings.from_env(env)
     assert s.tools_dir == Path("~/my-tools").expanduser()
+    assert s.profiles_dir == Path("~/my-profiles").expanduser()
     assert s.dataset_dir == Path("~/voices").expanduser()
     assert s.models_dir == Path("~/models").expanduser()
     assert s.checkpoint == Path("~/models/frieren").expanduser()
@@ -134,9 +146,11 @@ def test_relative_paths_are_relative_to_the_working_directory(tmp_path):
         "HERALD_MODELS_DIR": "voices",
         "HERALD_CHECKPOINT": "voices/frieren",
         "HERALD_TOOLS_DIR": "my-tools",
+        "HERALD_PROFILES_DIR": "my-profiles",
     }
     s = Settings.from_env(env)
     assert s.tools_dir == Path("my-tools")
+    assert s.profiles_dir == Path("my-profiles")
     assert s.models_dir == Path("voices")
     assert s.checkpoint == Path("voices/frieren")
     assert s.checkpoint_dir == Path("voices") / "xtts_v2"

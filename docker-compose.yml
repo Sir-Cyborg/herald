@@ -53,6 +53,7 @@ services:
       HERALD_OLLAMA_MODEL: ${HERALD_OLLAMA_MODEL:-}
       HERALD_OLLAMA_TIMEOUT: ${HERALD_OLLAMA_TIMEOUT:-}
       HERALD_SYSTEM_PROMPT: ${HERALD_SYSTEM_PROMPT:-}
+      HERALD_PROFILE: ${HERALD_PROFILE:-}
       HERALD_CHECKPOINT: ${HERALD_CHECKPOINT:-}
       HERALD_DATASET_DIR: ${HERALD_DATASET_DIR:-}
       HERALD_LANGUAGE: ${HERALD_LANGUAGE:-}
@@ -67,6 +68,8 @@ services:
       - ./models:/app/models
       - ./runs:/app/runs
       - ./output:/app/output
+      # Voice profiles (committed to git). Read-write: `new-profile` and `train` write them.
+      - ./profiles:/app/profiles
       # The user's tool scripts (committed to git). The container only reads them: edit on the host.
       - ./tools:/app/tools:ro
     stdin_open: true # `chat` reads from the terminal

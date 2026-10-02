@@ -1,6 +1,7 @@
 """Command line interface.
 
-``herald synthesize | train | slim | chat | tools | download-checkpoints``.
+``herald synthesize | train | slim | chat | tools | profiles | new-profile |
+download-checkpoints``.
 
 This module must stay cheap to import so that ``herald --help`` is instant: torch,
 coqui-tts, numpy and requests are only imported inside the command handlers.
@@ -9,23 +10,20 @@ coqui-tts, numpy and requests are only imported inside the command handlers.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
-import itertools
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
-import tempfile
-import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from herald import __version__
-from herald.config import DEFAULT_OLLAMA_TIMEOUT, Settings
-from herald.errors import ConfigError, HeraldError
+from herald.config import DEFAULT_OLLAMA_TIMEOUT, Settings, read_utf8
+from herald.errors import ConfigError, HeraldError, ProfileError
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +72,17 @@ _POSITIVE_FLOAT = _number(float, 0, above=True)
 # --- parser -----------------------------------------------------------------------------------
 
 
-def _paths_parent(settings: Settings) -> argparse.ArgumentParser:
+# Where a default comes from, for the options a profile can set: the profile if there is one
+# (``pd``, see ``profiles.profile_defaults``), otherwise the environment or the built-in value.
+# So the precedence is: command line option > profile > environment > built-in default.
+
+
+def _paths_parent(settings: Settings, pd: Mapping) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument(
         "--dataset-dir",
         type=Path,
-        default=settings.dataset_dir,
+        default=pd.get("dataset_dir", settings.dataset_dir),
         help="Dataset directory (audio/ plus metadata.csv). Env: HERALD_DATASET_DIR.",
     )
     p.add_argument(
@@ -102,13 +105,26 @@ def _tools_parent(settings: Settings) -> argparse.ArgumentParser:
     return p
 
 
-def _voice_parent(settings: Settings) -> argparse.ArgumentParser:
+def _profile_parent(settings: Settings) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument(
+        "--profile",
+        metavar="NAME_OR_PATH",
+        default=settings.profile,
+        help="Voice profile: a name from the profiles directory, or the path of a .toml file. "
+        "It sets the defaults of the options it contains; options given here win over it. "
+        "Env: HERALD_PROFILE.",
+    )
+    return p
+
+
+def _voice_parent(settings: Settings, pd: Mapping) -> argparse.ArgumentParser:
     """Options shared by the commands that speak (synthesize, chat)."""
-    p = argparse.ArgumentParser(add_help=False, parents=[_paths_parent(settings)])
+    p = argparse.ArgumentParser(add_help=False, parents=[_paths_parent(settings, pd)])
     p.add_argument(
         "--checkpoint",
         type=Path,
-        default=settings.checkpoint,
+        default=pd.get("checkpoint", settings.checkpoint),
         help="Fine-tuned voice: a checkpoint file or a directory holding best_model.pth "
         "(e.g. models/frieren). Omit to use the base model. Env: HERALD_CHECKPOINT.",
     )
@@ -117,20 +133,31 @@ def _voice_parent(settings: Settings) -> argparse.ArgumentParser:
         action="append",
         type=Path,
         metavar="WAV",
+        # No default here, not even a profile's: argparse would add the clips given on the
+        # command line to it instead of replacing it. main() fills it in after parsing.
         help="Reference clip for the voice (repeatable). Default: random clips from the dataset.",
     )
     p.add_argument(
         "--num-references",
         type=_POSITIVE_INT,
-        default=3,
+        default=pd.get("num_references", 3),
         help="Dataset clips to use as reference.",
     )
     p.add_argument("--seed", type=int, default=42, help="Seed for picking reference clips.")
-    p.add_argument("--language", default=settings.language, help="Language. Env: HERALD_LANGUAGE.")
-    p.add_argument("--temperature", type=_POSITIVE_FLOAT, default=0.7, help="Sampling temperature.")
+    p.add_argument(
+        "--language",
+        default=pd.get("language", settings.language),
+        help="Language. Env: HERALD_LANGUAGE.",
+    )
+    p.add_argument(
+        "--temperature",
+        type=_POSITIVE_FLOAT,
+        default=pd.get("temperature", 0.7),
+        help="Sampling temperature.",
+    )
     p.add_argument(
         "--device",
-        default=settings.device,
+        default=pd.get("device", settings.device),
         help="auto, cpu, mps, cuda or cuda:N (auto: cuda > mps > cpu). Env: HERALD_DEVICE.",
     )
     p.add_argument(
@@ -145,7 +172,9 @@ def _voice_parent(settings: Settings) -> argparse.ArgumentParser:
     return p
 
 
-def build_parser(settings: Settings) -> argparse.ArgumentParser:
+def build_parser(settings: Settings, pd: Mapping | None = None) -> argparse.ArgumentParser:
+    """The argument parser. ``pd`` holds the defaults a voice profile sets, by option name."""
+    pd = {} if pd is None else pd
     parser = argparse.ArgumentParser(
         prog="herald",
         description="Voice-cloning text-to-speech (XTTS-v2) with fine-tuning and LLM chat.",
@@ -162,7 +191,9 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
 
     # synthesize
     p = add(
-        "synthesize", "Speak a text and write it to a WAV file.", parents=[_voice_parent(settings)]
+        "synthesize",
+        "Speak a text and write it to a WAV file.",
+        parents=[_voice_parent(settings, pd), _profile_parent(settings)],
     )
     p.add_argument(
         "text", nargs="?", help="Text to speak. Or use --text-file, or pipe it on stdin."
@@ -181,7 +212,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p = add(
         "train",
         "Fine-tune XTTS-v2 on a dataset (CUDA if available, otherwise the CPU).",
-        parents=[_paths_parent(settings)],
+        parents=[_paths_parent(settings, pd), _profile_parent(settings)],
     )
     p.add_argument(
         "--runs-dir",
@@ -203,10 +234,15 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42, help="Seed for the train/eval split.")
     p.add_argument(
         "--speaker-name",
+        default=pd.get("speaker_name"),
         help="Speaker label; the voice is saved as <models dir>/<speaker>/best_model.pth "
         "(env HERALD_MODELS_DIR). Default: the dataset directory name.",
     )
-    p.add_argument("--language", default=settings.language, help="Language. Env: HERALD_LANGUAGE.")
+    p.add_argument(
+        "--language",
+        default=pd.get("language", settings.language),
+        help="Language. Env: HERALD_LANGUAGE.",
+    )
     p.add_argument("--run-name", help="Run name. Default: <speaker>_full or <speaker>_smoke.")
     p.add_argument("--project-name", help="Project name. Default: <speaker>_xtts.")
     p.add_argument(
@@ -270,11 +306,13 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p = add(
         "chat",
         "Talk to a local Ollama model and hear the replies in the cloned voice.",
-        parents=[_voice_parent(settings), _tools_parent(settings)],
+        parents=[_voice_parent(settings, pd), _tools_parent(settings), _profile_parent(settings)],
     )
     p.add_argument("--ollama-url", default=settings.ollama_url, help="Env: HERALD_OLLAMA_URL.")
     p.add_argument(
-        "--ollama-model", default=settings.ollama_model, help="Env: HERALD_OLLAMA_MODEL."
+        "--ollama-model",
+        default=pd.get("ollama_model", settings.ollama_model),
+        help="Env: HERALD_OLLAMA_MODEL.",
     )
     p.add_argument(
         "--ollama-timeout",
@@ -284,13 +322,18 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     )
     prompt = p.add_mutually_exclusive_group()
     prompt.add_argument(
-        "--system-prompt", default=settings.system_prompt, help="Env: HERALD_SYSTEM_PROMPT."
+        "--system-prompt",
+        default=pd.get("system_prompt", settings.system_prompt),
+        help="Env: HERALD_SYSTEM_PROMPT.",
     )
     prompt.add_argument(
         "--system-prompt-file", type=Path, help="Read the system prompt from a file."
     )
     p.add_argument(
-        "--history", type=int, default=10, help="Past exchanges sent to the model (0: none)."
+        "--history",
+        type=int,
+        default=pd.get("history", 10),
+        help="Past exchanges sent to the model (0: none).",
     )
     p.add_argument(
         "--save-dir",
@@ -325,11 +368,45 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     )
     p.set_defaults(func=_cmd_tools)
 
+    # profiles
+    p = add(
+        "profiles",
+        "List the voice profiles, or show one with its resolved values and problems.",
+    )
+    p.add_argument("name", nargs="?", help="Profile to show. Without it, every profile is listed.")
+    p.set_defaults(func=_cmd_profiles)
+
+    # new-profile
+    p = add(
+        "new-profile",
+        "Create a voice profile: a voice and its character in profiles/NAME.toml.",
+    )
+    p.add_argument("name", help="Profile name: letters, digits, '-' and '_'.")
+    p.add_argument("--description", help="One line about the profile, shown by `herald profiles`.")
+    p.add_argument("--checkpoint", type=Path, help="Fine-tuned voice. Omit for the base voice.")
+    p.add_argument("--dataset", type=Path, help="Dataset directory to pick reference clips from.")
+    p.add_argument(
+        "--reference-wav",
+        action="append",
+        type=Path,
+        metavar="WAV",
+        help="Reference clip (repeatable), used instead of picking clips from the dataset.",
+    )
+    p.add_argument("--language", help="Language of the voice, for example en or it.")
+    character = p.add_mutually_exclusive_group()
+    character.add_argument("--system-prompt", help="The character: the text of the system prompt.")
+    character.add_argument(
+        "--system-prompt-file", type=Path, help="The character, read from this file."
+    )
+    p.add_argument("--ollama-model", help="Ollama model to chat with.")
+    p.add_argument("--force", action="store_true", help="Replace the profile if it exists.")
+    p.set_defaults(func=_cmd_new_profile)
+
     # download-checkpoints
     p = add(
         "download-checkpoints",
         "Download the base XTTS-v2 weights (about 2 GB) into the checkpoint directory.",
-        parents=[_paths_parent(settings)],
+        parents=[_paths_parent(settings, pd)],
     )
     p.add_argument(
         "--base-url", default=settings.checkpoint_url, help="Env: HERALD_CHECKPOINT_URL."
@@ -350,55 +427,12 @@ def _cmd_download_checkpoints(args: argparse.Namespace, settings: Settings) -> i
     return 0
 
 
-def _load_engine(args: argparse.Namespace, settings: Settings):
-    """Pick reference clips and load the base or fine-tuned model."""
-    from herald.dataset import metadata
-    from herald.tts import engine
-
-    if args.reference_wav:
-        for wav in args.reference_wav:
-            if not wav.is_file():
-                raise FileNotFoundError(f"Reference wav not found: {wav}")
-        references = [str(w) for w in args.reference_wav]
-    else:
-        metadata_csv = args.dataset_dir / metadata.METADATA_FILE
-        if not metadata_csv.is_file():
-            raise ConfigError(
-                f"No dataset found at {args.dataset_dir} (no {metadata.METADATA_FILE}): pass "
-                "--reference-wav CLIP.wav (repeatable, a few seconds of the voice) "
-                "or --dataset-dir DIR"
-            )
-        references = metadata.pick_reference_wavs(
-            metadata_csv, args.dataset_dir, n=args.num_references, seed=args.seed
-        )
-    logger.info("Reference clips: %s", ", ".join(references))
-
-    finetuned = engine.resolve_finetuned_checkpoint(args.checkpoint) if args.checkpoint else None
-    return engine.load_engine(
-        args.checkpoint_dir,
-        references,
-        finetuned_checkpoint=finetuned,
-        device=args.device,
-        language=args.language,
-        temperature=args.temperature,
-        checkpoint_url=settings.checkpoint_url,
-    )
-
-
-def _read_utf8(path: Path) -> str:
-    """Read a UTF-8 text file; a BOM (Windows Notepad adds one) is dropped."""
-    try:
-        return path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        raise ConfigError(f"{path} is not a UTF-8 text file") from None
-
-
 def _read_text(args: argparse.Namespace) -> str:
     """The text to speak: the TEXT argument, or --text-file, or stdin when it is piped."""
     if args.text is not None and args.text_file:
         raise ConfigError("Pass either TEXT or --text-file, not both")
     if args.text_file:
-        text = _read_utf8(args.text_file)
+        text = read_utf8(args.text_file)
     elif args.text is not None:
         text = args.text
     elif not sys.stdin.isatty():
@@ -416,8 +450,9 @@ def _cmd_synthesize(args: argparse.Namespace, settings: Settings) -> int:
 
     from herald import audio_playback
     from herald.tts import engine
+    from herald.voice import load_engine
 
-    eng = _load_engine(args, settings)
+    eng = load_engine(args, settings)
     wav = eng.synth_long(text, pause_ms=args.pause_ms, max_chars=args.max_chars)
     engine.save_wav(output, wav, eng.sample_rate)
     print(f"Wrote {output} ({len(wav) / eng.sample_rate:.1f}s)")
@@ -482,7 +517,34 @@ def _cmd_train(args: argparse.Namespace, settings: Settings) -> int:
         if result.freed_bytes > 0:
             print(f"Freed {_human_size(result.freed_bytes)} of checkpoints")
         print(f"Use it with:  {_synthesize_hint(args, settings, result.model_path)}")
+        _create_voice_profile(params, result.model_path, settings)
     return 0
+
+
+def _create_voice_profile(params, model_path: Path, settings: Settings) -> None:
+    """Give a freshly trained voice a profile, unless one with that name exists (never replaced).
+
+    The profile is named after the voice folder, so a smoke run (``<speaker>_smoke``) never
+    touches the profile of the real voice.
+    """
+    from herald import profiles
+
+    name = model_path.parent.name
+    root = settings.project_root
+    values = {
+        "description": f"Created by herald train on {time.strftime('%Y-%m-%d')}",
+        "checkpoint": profiles.relative_to_root(model_path.parent, root),
+        "dataset": profiles.relative_to_root(params.dataset_dir, root),
+        "language": params.language,
+    }
+    try:
+        path, created = profiles.ensure_profile(settings.profiles_dir, name, values)
+    except ProfileError as exc:  # the training worked; only the convenience did not
+        print(f"warning: no profile was created: {exc}", file=sys.stderr)
+        return
+    if created:
+        shown = profiles.relative_to_root(path, root)
+        print(f"Profile created: {shown} (use it with: herald chat --profile {name})")
 
 
 def _print_dataset_check(report) -> None:
@@ -591,186 +653,107 @@ def _synthesize_hint(args: argparse.Namespace, settings: Settings, model_path: P
     return " ".join(parts)
 
 
-def _chat_settings(args: argparse.Namespace, settings: Settings) -> tuple[str, float]:
-    """The system prompt and the Ollama timeout. Read first, so that a bad file or value fails
-    before the voice model is loaded."""
-    system_prompt = (
-        _read_utf8(args.system_prompt_file).strip()
-        if args.system_prompt_file
-        else args.system_prompt
-    )
-    timeout = args.ollama_timeout if args.ollama_timeout is not None else settings.ollama_timeout
-    return system_prompt, timeout
-
-
-def _build_assistant(args: argparse.Namespace, system_prompt: str, timeout: float, tools):
-    """The chat brain: an Ollama client wrapped in an Assistant (system prompt, history, tools)."""
-    from herald.assistant import Assistant
-    from herald.llm.ollama_client import OllamaClient
-
-    client = OllamaClient(args.ollama_url, args.ollama_model, timeout=timeout)
-    return Assistant(
-        client,
-        system_prompt,
-        tools=tools,
-        history_turns=args.history,
-        use_triggers=not args.always_offer_tools,
-    )
-
-
-def _make_speaker(args: argparse.Namespace, settings: Settings, stack: contextlib.ExitStack):
-    """Load the voice and return ``speak(text, kind, number)``, which speaks one text.
-
-    ``kind`` is ``"chat"`` for a reply or ``"alert"`` for a timer, and only matters for the
-    file name. Returns None for a text-only chat (``--no-play`` without ``--save-dir``):
-    nothing would be done with the audio, so the model is not loaded. Texts are kept in
-    ``--save-dir`` when given; otherwise each one is written to a single scratch file,
-    overwritten every time and removed with its directory when ``stack`` closes, whatever
-    ends the session.
-
-    One lock serializes all speaking: a timer alert comes from another thread and must neither
-    overlap a reply nor overwrite the scratch file while the player reads it. When ``stack``
-    closes, the utterance in progress is allowed to finish and later ones are dropped, so
-    nothing is written into the scratch directory after it is removed.
-    """
-    if args.no_play and args.save_dir is None:
-        print(
-            "Audio is neither played nor saved (--no-play without --save-dir): chatting in "
-            "text only. Add --save-dir DIR to keep WAV files.",
-            file=sys.stderr,
-        )
-        return None
-
-    from herald import audio_playback
-    from herald.tts import engine
-
-    eng = _load_engine(args, settings)
-    folder = args.save_dir or Path(
-        stack.enter_context(tempfile.TemporaryDirectory(prefix="herald-chat-"))
-    )
-    session = time.strftime("%Y%m%d_%H%M%S")
-    lock = threading.Lock()
-    closed = False
-    warned_no_player = False
-
-    def close() -> None:
-        nonlocal closed
-        with lock:  # waits for the utterance in progress
-            closed = True
-
-    stack.callback(close)
-
-    def speak(text: str, kind: str, number: int) -> None:
-        nonlocal warned_no_player
-        with lock:
-            if closed:
-                return
-            wav = eng.synth_long(text, pause_ms=args.pause_ms, max_chars=args.max_chars)
-            # Saved texts are numbered; a scratch one reuses one name, so only one is on disk.
-            name = f"{kind}_{session}_{number:03d}.wav" if args.save_dir else "speech.wav"
-            path = engine.save_wav(folder / name, wav, eng.sample_rate)
-            if not args.no_play and not audio_playback.play_wav(path) and not warned_no_player:
-                warned_no_player = True
-                print(
-                    "No audio player available; "
-                    + (
-                        f"replies are saved in {args.save_dir}"
-                        if args.save_dir
-                        else "use --save-dir DIR to keep the replies as WAV files."
-                    ),
-                    file=sys.stderr,
-                )
-
-    return speak
-
-
-def _make_announcer(speak):
-    """The ``say`` function of the tools: a timer that fires prints and speaks its message.
-
-    It runs on a timer thread while the main thread waits in ``input()``, and never raises.
-    In a text-only chat (``speak`` is None) it only prints.
-    """
-    numbers = itertools.count(1)
-
-    def announce(text: str) -> None:
-        # One write, so the alert is not split by the main thread's own printing.
-        sys.stdout.write(f"\a\n[Herald] {text}\n")
-        sys.stdout.flush()
-        if speak is None:
-            return
-        try:
-            speak(text, "alert", next(numbers))
-        except Exception as exc:  # a failed alert must not kill the timer thread
-            logger.debug("Speech synthesis failed", exc_info=True)
-            print(f"error: could not speak the reply: {exc}", file=sys.stderr)
-
-    return announce
-
-
-def _stop_timers(scheduler) -> None:
-    cancelled = scheduler.shutdown()
-    if cancelled:
-        print(
-            f"{cancelled} timer(s) were still running and have been cancelled because the "
-            "chat ended.",
-            file=sys.stderr,
-        )
-
-
-def _load_chat_tools(args: argparse.Namespace, announce, stack: contextlib.ExitStack):
-    """Load the tools for the assistant: the registry, or None (``--no-tools``, none found).
-
-    The timers are cancelled when ``stack`` closes. Load errors are warnings: a broken tool
-    script must not stop the chat.
-    """
-    if args.no_tools:
-        return None
-    from herald.tools import ToolContext, load_tools
-    from herald.tools.scheduler import Scheduler
-
-    scheduler = Scheduler()
-    stack.callback(_stop_timers, scheduler)
-    report = load_tools(args.tools_dir, ToolContext(say=announce, scheduler=scheduler))
-    for error in report.errors:
-        print(f"warning: tools: {error}", file=sys.stderr)
-    if report.tools:
-        print("Tools: " + ", ".join(tool.name for tool in report.tools))
-    return report.registry if len(report.registry) else None
-
-
 def _cmd_chat(args: argparse.Namespace, settings: Settings) -> int:
-    from herald.errors import OllamaError
+    from herald.chat import run_chat
 
-    system_prompt, timeout = _chat_settings(args, settings)
-    with contextlib.ExitStack() as stack:
-        speak = _make_speaker(args, settings, stack)
-        # Registered after the speaker, so the timers are cancelled before it closes.
-        tools = _load_chat_tools(args, _make_announcer(speak), stack)
-        assistant = _build_assistant(args, system_prompt, timeout, tools)
+    return run_chat(args, settings)
 
-        print("Type a message; an empty line or Ctrl-D quits.")
-        for turn in itertools.count(1):
-            try:
-                user_text = input("You: ").strip()
-            except EOFError:
-                break
-            if not user_text:
-                break
 
-            try:
-                reply = assistant.respond(user_text)
-            except OllamaError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                continue
-            print(f"Herald: {reply}")
+def _table(rows: list[tuple[str, ...]]) -> list[str]:
+    """Rows of text as lines with the columns aligned (the last column is not padded)."""
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
+    return [
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=False))
+        + "  "
+        + row[-1]
+        for row in rows
+    ]
 
-            if speak is None:
-                continue
-            try:
-                speak(reply, "chat", turn)
-            except Exception as exc:  # one failed reply must not end the conversation
-                logger.debug("Speech synthesis failed", exc_info=True)
-                print(f"error: could not speak the reply: {exc}", file=sys.stderr)
+
+def _cmd_profiles(args: argparse.Namespace, settings: Settings) -> int:
+    from herald import profiles
+
+    root = settings.project_root
+    if args.name is not None:
+        profile = profiles.load_profile(args.name, settings.profiles_dir, root)
+        print(f"{profile.name}  ({profiles.relative_to_root(profile.path, root)})")
+        for key, value in profile.values.items():
+            if isinstance(value, Path):
+                value = profiles.relative_to_root(value, root)
+            elif isinstance(value, list):
+                value = ", ".join(profiles.relative_to_root(item, root) for item in value)
+            print(f"  {key}: " + str(value).replace("\n", "\n    "))
+        if "checkpoint" not in profile.values:
+            print("  voice: base voice (no checkpoint)")
+        for problem in profiles.check_profile(profile):
+            print(f"  ! {problem}")
+        return 0
+
+    summaries = profiles.list_profiles(settings.profiles_dir, root)
+    if not summaries:
+        print(f"No profiles in {settings.profiles_dir}. Create one with: herald new-profile NAME")
+        return 0
+    rows = [
+        (
+            summary.name,
+            summary.language or "-",
+            summary.checkpoint or "base voice",
+            summary.description,
+        )
+        for summary in summaries
+    ]
+    for summary, line in zip(summaries, _table(rows), strict=True):
+        print(("! " if summary.problems else "  ") + line.rstrip())
+        for problem in summary.problems:
+            print(f"    ! {problem}")
+    return 0
+
+
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _cmd_new_profile(args: argparse.Namespace, settings: Settings) -> int:
+    from herald import profiles
+
+    if not _PROFILE_NAME.fullmatch(args.name):
+        raise ProfileError(f"Invalid profile name {args.name!r}: use letters, digits, '-' and '_'")
+    root = settings.project_root
+
+    def project_path(path: Path) -> str:
+        # Typed relative to the current directory; a profile's paths are relative to the root.
+        return profiles.relative_to_root(Path(os.path.abspath(path.expanduser())), root)
+
+    values: dict[str, object] = {}
+    if args.description is not None:
+        values["description"] = args.description
+    if args.checkpoint is not None:
+        values["checkpoint"] = project_path(args.checkpoint)
+    if args.dataset is not None:
+        values["dataset"] = project_path(args.dataset)
+    if args.reference_wav:
+        values["reference_wavs"] = [project_path(wav) for wav in args.reference_wav]
+    if args.language is not None:
+        values["language"] = args.language
+    if args.system_prompt is not None:
+        values["system_prompt"] = args.system_prompt
+    if args.system_prompt_file is not None:
+        if not args.system_prompt_file.is_file():
+            raise ProfileError(f"System prompt file not found: {args.system_prompt_file}")
+        values["system_prompt_file"] = project_path(args.system_prompt_file)
+    if args.ollama_model is not None:
+        values["ollama_model"] = args.ollama_model
+
+    path = settings.profiles_dir / f"{args.name}.toml"
+    shown = profiles.relative_to_root(path, root)
+    existed = path.exists()
+    if existed and not args.force:
+        raise ProfileError(f"{shown} already exists: use --force to replace it")
+    profiles.write_profile(path, values, overwrite=args.force)
+    profile = profiles.load_profile(args.name, settings.profiles_dir, root)  # it must load again
+    for problem in profiles.check_profile(profile):
+        print(f"warning: {problem}", file=sys.stderr)
+    print(f"{'Replaced' if existed else 'Created'} {shown}")
+    print(f"Use it with: herald chat --profile {args.name}")
     return 0
 
 
@@ -830,15 +813,97 @@ def _configure_logging(verbose: bool) -> None:
     logging.getLogger("herald").setLevel(logging.DEBUG if verbose else logging.NOTSET)
 
 
+# The commands that have --profile.
+_PROFILE_COMMANDS = ("synthesize", "chat", "train")
+
+
+def _select_profile(argv: Sequence[str], settings: Settings):
+    """The profile the command line selects (``--profile``, else HERALD_PROFILE), or None.
+
+    It must be known before the real parser is built, because its values become the defaults of
+    that parser's options, so ``--profile`` is looked for by a tiny parser of its own. Only the
+    commands that have the option look at it: a broken HERALD_PROFILE must not get in the way of
+    ``herald slim``. Raises ProfileError if the profile cannot be loaded.
+    """
+    # No global option takes a value, so the command is the first word that is not an option.
+    command = next((arg for arg in argv if not arg.startswith("-")), None)
+    if command not in _PROFILE_COMMANDS:
+        return None
+    pre = argparse.ArgumentParser(prog="herald", add_help=False, allow_abbrev=False)
+    pre.add_argument("--profile", default=settings.profile)
+    name = pre.parse_known_args(list(argv))[0].profile
+    if not name:
+        return None
+    from herald import profiles
+
+    return profiles.load_profile(name, settings.profiles_dir, settings.project_root)
+
+
+def _use_profile(args: argparse.Namespace, profile, settings: Settings) -> bool:
+    """Apply ``profile`` to the parsed arguments. False, after saying why, if it cannot be used.
+
+    Its values are already the defaults of the options (see ``build_parser``), except the list of
+    reference clips, which is filled in here. Then comes the check that the files it points to
+    exist, so that a wrong path fails at once and not after the model has loaded. A problem is
+    ignored when the command line overrides what it is about: ``--checkpoint`` makes the
+    profile's checkpoint moot, ``--dataset-dir`` its dataset, and ``--reference-wav`` its clips
+    and its dataset (the clips are picked from it only when none are given). ``train`` does not
+    check anything: its checkpoint is what it is about to create.
+    """
+    from herald import profiles
+
+    defaults = profiles.profile_defaults(profile)
+    explicit_clips = getattr(args, "reference_wav", None) is not None
+    if hasattr(args, "reference_wav") and not explicit_clips and "reference_wav" in defaults:
+        args.reference_wav = defaults["reference_wav"]
+
+    shown = profiles.relative_to_root(profile.path, settings.project_root)
+    print(f"Profile: {profile.name} ({shown})", file=sys.stderr)
+    if args.command == "train":
+        return True
+
+    moot = set()
+    if args.checkpoint != defaults.get("checkpoint"):
+        moot.add("checkpoint")
+    if args.dataset_dir != defaults.get("dataset_dir"):
+        moot.add("dataset")
+    if explicit_clips:
+        moot.update(("reference_wavs", "dataset"))
+    usable = dataclasses.replace(
+        profile, values={k: v for k, v in profile.values.items() if k not in moot}
+    )
+    problems = profiles.check_profile(usable)
+    for problem in problems:
+        print(f"error: profile {profile.name}: {problem}", file=sys.stderr)
+    return not problems
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     try:
         settings = Settings.from_env()
     except HeraldError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    args = build_parser(settings).parse_args(argv)
+
+    try:
+        profile = _select_profile(argv, settings)
+    except ProfileError as exc:
+        if "-h" not in argv and "--help" not in argv:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        profile = None  # the help must work even if the profile does not
+    pd = {}
+    if profile is not None:
+        from herald import profiles
+
+        pd = profiles.profile_defaults(profile)
+
+    args = build_parser(settings, pd).parse_args(argv)
     _configure_logging(args.verbose)
     try:
+        if profile is not None and not _use_profile(args, profile, settings):
+            return 1
         return args.func(args, settings)
     except KeyboardInterrupt:
         print(file=sys.stderr)

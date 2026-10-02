@@ -1,26 +1,22 @@
 """CLI: --help for every command, argument wiring with the heavy modules replaced by fakes."""
 
-import contextlib
 import io
 import os
 import re
 import subprocess
 import sys
-import tempfile
-import threading
+import tomllib
 import wave
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import requests
 
 from herald import cli
-from herald.config import DEFAULT_CHECKPOINT_URL, DEFAULT_OLLAMA_TIMEOUT, Settings
-from herald.errors import CheckpointError, HeraldError, OllamaError
-from herald.tools import LoadReport, ToolContext, ToolRegistry
-from herald.tools.scheduler import Scheduler
+from herald.config import DEFAULT_CHECKPOINT_URL
+from herald.errors import CheckpointError, HeraldError
+from herald.tools import LoadReport, ToolRegistry
 from herald.tts.slim import SlimResult
 from herald.tts.train import TrainResult
 
@@ -49,7 +45,16 @@ def whisper(text: str) -> str:
     return text.lower()
 """
 
-COMMANDS = ["synthesize", "train", "slim", "chat", "tools", "download-checkpoints"]
+COMMANDS = [
+    "synthesize",
+    "train",
+    "slim",
+    "chat",
+    "tools",
+    "profiles",
+    "new-profile",
+    "download-checkpoints",
+]
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +110,29 @@ def fake_load(monkeypatch):
 
 def voice_args(dataset_dir, tmp_path):
     return ["--dataset-dir", str(dataset_dir), "--checkpoint-dir", str(tmp_path / "ckpt")]
+
+
+def make_profile(tmp_path, name, text=""):
+    """Write ``profiles/<name>.toml`` in the test project and return its path."""
+    folder = tmp_path / "project" / "profiles"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{name}.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def handled(monkeypatch):
+    """Replace the handlers of synthesize, chat and train with recorders of their arguments."""
+    seen = SimpleNamespace(args=[])
+
+    def record(args, settings):
+        seen.args.append(args)
+        return 0
+
+    for name in ("_cmd_synthesize", "_cmd_chat", "_cmd_train"):
+        monkeypatch.setattr(cli, name, record)
+    return seen
 
 
 # --- help ---------------------------------------------------------------------------------------
@@ -660,6 +688,108 @@ class TestTrain:
         assert "No fine-tuned model was saved" in out
         assert "herald synthesize" not in out
 
+    # --- the profile that a successful training leaves behind -------------------------------
+
+    @pytest.fixture
+    def project_voice(self, tmp_path, trained):
+        """A trained voice inside the project, so that its paths come out relative."""
+        voice = tmp_path / "project" / "models" / "frieren"
+        trained.result = TrainResult(tmp_path / "runs" / "finished", voice / "best_model.pth")
+        return voice
+
+    def profile_file(self, tmp_path, name="frieren"):
+        return tmp_path / "project" / "profiles" / f"{name}.toml"
+
+    def test_a_profile_is_created_for_the_new_voice(self, tmp_path, trained, project_voice, capsys):
+        dataset = tmp_path / "project" / "dataset" / "frieren"
+        argv = ["train", "--dataset-dir", str(dataset), "--language", "it"]
+        code, out, _ = run([*argv, "--checkpoint-dir", str(tmp_path / "ckpt")], capsys)
+        assert code == 0
+        values = tomllib.loads(self.profile_file(tmp_path).read_text(encoding="utf-8"))
+        assert re.fullmatch(
+            r"Created by herald train on \d{4}-\d{2}-\d{2}", values.pop("description")
+        )
+        assert values == {
+            "checkpoint": "models/frieren",
+            "dataset": "dataset/frieren",
+            "language": "it",
+        }
+        assert (
+            "Profile created: profiles/frieren.toml (use it with: herald chat --profile frieren)\n"
+        ) in out
+
+    def test_the_created_profile_is_usable(self, tmp_path, trained, project_voice, capsys):
+        project_voice.mkdir(parents=True)
+        (project_voice / "best_model.pth").write_bytes(b"x")
+        dataset = tmp_path / "project" / "dataset" / "frieren"
+        dataset.mkdir(parents=True)
+        (dataset / "metadata.csv").write_text("audio/a.wav|Hi.\n", encoding="utf-8")
+        run(
+            ["train", "--dataset-dir", str(dataset), "--checkpoint-dir", str(tmp_path / "c")],
+            capsys,
+        )
+        code, out, _ = run(["profiles"], capsys)
+        assert code == 0 and "frieren" in out and "!" not in out  # no problems reported
+
+    def test_an_existing_profile_is_never_touched_nor_mentioned(
+        self, tmp_path, trained, project_voice, capsys
+    ):
+        mine = make_profile(tmp_path, "frieren", 'description = "My own edits"\nlanguage = "ja"\n')
+        code, out, err = run(["train", *voice_args(tmp_path / "speaker", tmp_path)], capsys)
+        assert code == 0
+        assert mine.read_text(encoding="utf-8") == 'description = "My own edits"\nlanguage = "ja"\n'
+        assert "Profile created" not in out and "profile" not in err.lower()
+
+    def test_a_second_training_keeps_the_first_profile(
+        self, tmp_path, trained, project_voice, capsys
+    ):
+        argv = ["train", *voice_args(tmp_path / "speaker", tmp_path)]
+        run([*argv, "--language", "it"], capsys)
+        first = self.profile_file(tmp_path).read_text(encoding="utf-8")
+        _, out, _ = run([*argv, "--language", "es"], capsys)
+        assert self.profile_file(tmp_path).read_text(encoding="utf-8") == first
+        assert "Profile created" not in out
+
+    def test_a_smoke_run_gets_its_own_profile_and_leaves_the_real_one_alone(
+        self, tmp_path, trained, capsys
+    ):
+        real = make_profile(tmp_path, "frieren", 'language = "en"\n')
+        smoke_voice = tmp_path / "project" / "models" / "frieren_smoke"
+        trained.result = TrainResult(tmp_path / "runs" / "r", smoke_voice / "best_model.pth")
+        code, out, _ = run(
+            ["train", "--smoke", *voice_args(tmp_path / "speaker", tmp_path)], capsys
+        )
+        assert code == 0
+        assert real.read_text(encoding="utf-8") == 'language = "en"\n'
+        values = tomllib.loads(self.profile_file(tmp_path, "frieren_smoke").read_text("utf-8"))
+        assert values["checkpoint"] == "models/frieren_smoke"
+        assert "herald chat --profile frieren_smoke" in out
+
+    def test_no_profile_when_no_model_was_saved(self, tmp_path, trained, capsys):
+        trained.result = TrainResult(tmp_path / "finished", None)
+        run(["train", *voice_args(tmp_path / "speaker", tmp_path)], capsys)
+        assert not (tmp_path / "project" / "profiles").exists()
+
+    def test_a_voice_folder_that_cannot_be_a_profile_name_only_gets_a_warning(
+        self, tmp_path, trained, capsys
+    ):
+        voice = tmp_path / "project" / "models" / "my voice"
+        trained.result = TrainResult(tmp_path / "finished", voice / "best_model.pth")
+        code, out, err = run(["train", *voice_args(tmp_path / "speaker", tmp_path)], capsys)
+        assert code == 0  # the training worked
+        assert "warning: no profile was created" in err and "my voice" in err
+        assert "Profile created" not in out
+
+    def test_a_profile_given_to_train_supplies_the_defaults(
+        self, tmp_path, trained, project_voice, capsys
+    ):
+        make_profile(tmp_path, "mario", 'language = "it"\nspeaker_name = "mario"\n')
+        argv = ["train", "--profile", "mario", "--checkpoint-dir", str(tmp_path / "ckpt")]
+        code, _, _ = run(argv, capsys)
+        assert code == 0
+        assert trained.kwargs[0]["language"] == "it"
+        assert trained.params[0].speaker_name == "mario"
+
     def test_dry_run_checks_the_dataset_without_training(
         self, dataset_dir, tmp_path, trained, capsys
     ):
@@ -786,690 +916,6 @@ class TestTrain:
         assert code == 1
         assert "epochs must be at least 1" in err
         assert trained.params == []
-
-
-# --- chat ---------------------------------------------------------------------------------------
-
-
-class TestChat:
-    @pytest.fixture
-    def assistant(self, monkeypatch):
-        """Replace Assistant with a script of replies; an exception in it is raised instead."""
-        from herald import assistant as assistant_module
-
-        seen = SimpleNamespace(created=[], said=[])
-        replies = iter(["First reply.", OllamaError("Ollama is down"), "Third reply.", "Fourth."])
-
-        class FakeAssistant:
-            def __init__(self, llm, system_prompt, **kwargs):
-                seen.created.append({"llm": llm, "system_prompt": system_prompt, **kwargs})
-
-            def respond(self, user_text):
-                seen.said.append(user_text)
-                reply = next(replies)
-                if isinstance(reply, Exception):
-                    raise reply
-                return reply
-
-        monkeypatch.setattr(assistant_module, "Assistant", FakeAssistant)
-        return seen
-
-    @pytest.fixture
-    def typed(self, monkeypatch):
-        """Feed the given lines to input(); EOF afterwards."""
-
-        def feed(*lines):
-            it = iter(lines)
-
-            def fake_input(prompt=""):
-                try:
-                    return next(it)
-                except StopIteration:
-                    raise EOFError from None
-
-            monkeypatch.setattr("builtins.input", fake_input)
-
-        return feed
-
-    @pytest.fixture(autouse=True)
-    def scratch_root(self, tmp_path, monkeypatch):
-        """Where tempfile puts the chat's scratch directory, so that tests can look inside."""
-        root = tmp_path / "scratch"
-        root.mkdir()
-        monkeypatch.setattr(tempfile, "tempdir", str(root))
-        return root
-
-    def chat_args(self, dataset_dir, tmp_path, *extra):
-        return ["chat", *voice_args(dataset_dir, tmp_path), *extra]
-
-    def keep(self, tmp_path):
-        """The option that keeps the replies, and the folder they end up in."""
-        return ["--save-dir", str(tmp_path / "wavs")]
-
-    def test_conversation_loop(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
-        typed("Hello", "Are you there?", "Still there?", "")
-
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
-
-        assert code == 0
-        assert len(assistant.created) == 1  # one conversation for the whole session
-        assert assistant.said == ["Hello", "Are you there?", "Still there?"]
-        assert "Herald: First reply." in out and "Herald: Third reply." in out
-        assert "error: Ollama is down" in err  # the failed turn does not end the session
-        # Only the replies that arrived are spoken, saved and played.
-        assert [c["text"] for c in fake_load.calls] == ["First reply.", "Third reply."]
-        assert [c["max_chars"] for c in fake_load.calls] == [None, None]
-        saved = sorted((tmp_path / "wavs").glob("chat_*.wav"))
-        assert [p.name[-7:-4] for p in saved] == ["001", "003"]  # turn 2 had no reply
-        assert [c.args[0] for c in play.call_args_list] == saved
-
-    def test_replies_are_kept_only_with_save_dir(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
-    ):
-        mocker.patch("herald.audio_playback.play_wav", return_value=True)
-        typed("a", "b", "c")
-        run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
-        assert len(list((tmp_path / "wavs").iterdir())) == 2  # exactly one file per spoken reply
-        assert list(scratch_root.iterdir()) == []  # no scratch directory was needed
-
-    def test_replies_are_played_from_one_scratch_file_and_nothing_is_left(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
-    ):
-        played = []
-
-        def play(path):
-            played.append((path, sorted(p.name for p in path.parent.iterdir())))
-            return True
-
-        mocker.patch("herald.audio_playback.play_wav", side_effect=play)
-        typed("a", "b", "c")
-
-        code, out, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
-
-        assert code == 0
-        assert "Herald: First reply." in out and "Herald: Third reply." in out
-        (first, listing1), (second, listing2) = played
-        assert first == second  # every reply is written over the previous one
-        assert first.parent.parent == scratch_root
-        assert first.parent.name.startswith("herald-chat-")
-        assert listing1 == listing2 == [first.name]  # at most one reply is ever on disk
-        assert list(scratch_root.iterdir()) == []  # the scratch directory is gone
-        assert not (tmp_path / "project" / "output").exists()  # ...and nothing went to output/
-
-    def test_the_scratch_directory_is_removed_on_ctrl_c(
-        self, dataset_dir, tmp_path, fake_load, assistant, mocker, monkeypatch, scratch_root, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
-        lines = iter(["Hello"])
-
-        def input_then_interrupt(prompt=""):
-            try:
-                return next(lines)
-            except StopIteration:
-                raise KeyboardInterrupt from None
-
-        monkeypatch.setattr("builtins.input", input_then_interrupt)
-        code, _, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 130
-        assert play.call_count == 1  # a reply had been written to the scratch directory
-        assert list(scratch_root.iterdir()) == []
-
-    def test_the_scratch_directory_is_removed_after_a_failed_synthesis(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, scratch_root, capsys
-    ):
-        def broken(text, pause_ms, max_chars):
-            raise RuntimeError("model exploded")
-
-        fake_load.synth_long = broken
-        typed("a", "b", "c")
-        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 0
-        assert err.count("could not speak the reply: model exploded") == 2
-        assert list(scratch_root.iterdir()) == []
-
-    def test_no_play_without_save_dir_is_a_text_only_chat(
-        self, tmp_path, fake_load, assistant, typed, mocker, scratch_root, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav")
-        typed("a", "b", "c")
-
-        # No dataset, no weights: nothing is needed because nothing is spoken.
-        code, out, err = run(self.chat_args(tmp_path / "no_dataset", tmp_path, "--no-play"), capsys)
-
-        assert code == 0
-        assert "Herald: First reply." in out and "Herald: Third reply." in out
-        assert fake_load.load_calls == [] and fake_load.calls == []  # the model is never loaded
-        play.assert_not_called()
-        assert err.count("chatting in text only") == 1
-        assert "Audio is neither played nor saved (--no-play without --save-dir)" in err
-        assert "Add --save-dir DIR to keep WAV files." in err
-        assert list(scratch_root.iterdir()) == []
-
-    def test_no_play_with_save_dir_saves_without_playing(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav")
-        typed("a", "b", "c")
-        args = self.chat_args(dataset_dir, tmp_path, "--no-play", *self.keep(tmp_path))
-        code, _, err = run(args, capsys)
-        assert code == 0
-        assert len(list((tmp_path / "wavs").glob("chat_*.wav"))) == 2
-        assert len(fake_load.load_calls) == 1
-        play.assert_not_called()
-        assert "text only" not in err
-
-    def test_a_failed_synthesis_does_not_end_the_session(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        mocker.patch("herald.audio_playback.play_wav", return_value=True)
-        real_synth = fake_load.synth_long
-
-        def flaky(text, pause_ms, max_chars):
-            if text == "First reply.":
-                raise RuntimeError("model exploded")
-            return real_synth(text, pause_ms, max_chars)
-
-        fake_load.synth_long = flaky
-        typed("one", "two", "three", "")
-
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
-
-        assert code == 0
-        assert "Herald: First reply." in out  # the text is shown even if it could not be spoken
-        assert "could not speak the reply: model exploded" in err
-        assert "Herald: Third reply." in out  # ...and the conversation carries on
-        assert len(list((tmp_path / "wavs").glob("chat_*.wav"))) == 1
-
-    def test_ollama_settings_reach_the_client(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        typed("Hi")
-        extra = ["--ollama-url", "http://ollama:11434", "--ollama-model", "mistral"]
-        extra += ["--ollama-timeout", "9", "--system-prompt", "Be brief.", "--no-play"]
-        run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
-        (created,) = assistant.created
-        client = created["llm"]
-        assert (client.base_url, client.model, client.timeout) == (
-            "http://ollama:11434",
-            "mistral",
-            9,
-        )
-        assert created["system_prompt"] == "Be brief."  # the Assistant owns the system prompt
-
-    def test_system_prompt_from_a_file(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("  You are a pirate.\n", encoding="utf-8")
-        typed("Hi")
-        run(self.chat_args(dataset_dir, tmp_path, "--system-prompt-file", str(prompt_file)), capsys)
-        (created,) = assistant.created
-        assert created["system_prompt"] == "You are a pirate."
-
-    def test_system_prompt_file_may_start_with_a_byte_order_mark(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        prompt_file = tmp_path / "notepad.txt"
-        prompt_file.write_bytes(b"\xef\xbb\xbfYou are a pirate.\r\n")
-        typed()
-        run(self.chat_args(dataset_dir, tmp_path, "--system-prompt-file", str(prompt_file)), capsys)
-        assert assistant.created[0]["system_prompt"] == "You are a pirate."
-
-    @pytest.mark.parametrize(
-        ("env", "option", "expected"),
-        [
-            (None, None, DEFAULT_OLLAMA_TIMEOUT),
-            ("7.5", None, 7.5),
-            ("7.5", "9", 9),
-            ("soon", "9", 9),  # the option wins, so the broken variable is never looked at
-        ],
-    )
-    def test_ollama_timeout_precedence(
-        self,
-        env,
-        option,
-        expected,
-        dataset_dir,
-        tmp_path,
-        fake_load,
-        assistant,
-        typed,
-        monkeypatch,
-        capsys,
-    ):
-        if env is not None:
-            monkeypatch.setenv("HERALD_OLLAMA_TIMEOUT", env)
-        typed()
-        extra = ["--ollama-timeout", option] if option else []
-        code, _, _ = run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
-        assert code == 0
-        assert assistant.created[0]["llm"].timeout == expected
-
-    def test_system_prompt_file_must_be_utf8(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_bytes(b"\xff\xfe\x00")
-        code, _, err = run(
-            self.chat_args(dataset_dir, tmp_path, "--system-prompt-file", str(prompt_file)), capsys
-        )
-        assert code == 1
-        assert "not a UTF-8 text file" in err
-        assert fake_load.load_calls == []  # fails before the model is loaded
-
-    @pytest.mark.parametrize(
-        ("extra", "turns"), [([], 10), (["--history", "3"], 3), (["--history", "0"], 0)]
-    )
-    def test_history_setting_reaches_the_assistant(
-        self, extra, turns, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        typed()
-        run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
-        assert assistant.created[0]["history_turns"] == turns
-
-    def test_missing_player_is_mentioned_once(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        mocker.patch("herald.audio_playback.play_wav", return_value=False)
-        typed("a", "b", "c")
-        _, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert err.count("No audio player available") == 1
-        # Nothing is kept, so it must not send the user looking for a folder of replies.
-        assert "use --save-dir DIR to keep the replies as WAV files" in err
-
-    def test_missing_player_with_save_dir_says_where_the_replies_are(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, mocker, capsys
-    ):
-        mocker.patch("herald.audio_playback.play_wav", return_value=False)
-        typed("a", "b", "c")
-        _, _, err = run(self.chat_args(dataset_dir, tmp_path, *self.keep(tmp_path)), capsys)
-        assert err.count("No audio player available") == 1
-        assert f"replies are saved in {tmp_path / 'wavs'}" in err
-
-    def test_ctrl_c_ends_the_session_quietly(
-        self, dataset_dir, tmp_path, fake_load, assistant, monkeypatch, capsys
-    ):
-        def interrupted(prompt=""):
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr("builtins.input", interrupted)
-        code, _, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 130
-
-    def test_with_the_real_assistant_history_stays_clean_after_an_ollama_error(
-        self, dataset_dir, tmp_path, fake_load, typed, mocker, capsys
-    ):
-        """CLI + Assistant + OllamaClient together; only the HTTP call is faked."""
-
-        def answer(text):
-            body = {"message": {"role": "assistant", "content": text}}
-            return SimpleNamespace(ok=True, status_code=200, json=lambda: body, text=str(body))
-
-        post = mocker.patch(
-            "requests.post",
-            side_effect=[answer("First."), requests.ConnectionError("down"), answer("Third.")],
-        )
-        typed("one", "two", "three")
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-
-        assert code == 0
-        assert "Herald: First." in out and "Herald: Third." in out
-        assert "error: Cannot connect to Ollama" in err
-        sent = [call.kwargs["json"]["messages"] for call in post.call_args_list]
-        assert [m["content"] for m in sent[2]][1:] == ["one", "First.", "three"]  # no "two"
-
-    # --- tools ----------------------------------------------------------------------------------
-
-    @pytest.fixture
-    def load_calls(self, monkeypatch):
-        """Spy on load_tools: records (tools_dir, context) and runs the real thing."""
-        import herald.tools
-
-        calls = []
-        real = herald.tools.load_tools
-
-        def load_tools(user_dir, context, **kwargs):
-            calls.append((user_dir, context))
-            return real(user_dir, context, **kwargs)
-
-        monkeypatch.setattr(herald.tools, "load_tools", load_tools)
-        return calls
-
-    def tool_names(self, registry):
-        return [schema["function"]["name"] for schema in registry.schemas()]
-
-    def test_the_tools_are_offered_to_the_assistant(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, capsys
-    ):
-        typed()
-        code, out, _ = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 0
-        ((user_dir, context),) = load_calls
-        assert user_dir == tmp_path / "project" / "tools"  # the default tools directory
-        assert isinstance(context, ToolContext) and isinstance(context.scheduler, Scheduler)
-        assert self.tool_names(assistant.created[0]["tools"]) == ["set_timer"]
-        assert "Tools: set_timer\n" in out
-
-    def test_tools_dir_option_and_environment(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, monkeypatch, capsys
-    ):
-        typed()
-        monkeypatch.setenv("HERALD_TOOLS_DIR", str(tmp_path / "from_env"))
-        run(self.chat_args(dataset_dir, tmp_path), capsys)
-        run(self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tmp_path / "mine")), capsys)
-        assert [d for d, _ in load_calls] == [tmp_path / "from_env", tmp_path / "mine"]
-
-    def test_your_own_tool_scripts_are_loaded(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        tools_dir = tmp_path / "mine"
-        tools_dir.mkdir()
-        (tools_dir / "shout.py").write_text(SHOUT_TOOL, encoding="utf-8")
-        typed()
-        _, out, _ = run(
-            self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tools_dir)), capsys
-        )
-        assert "Tools: set_timer, shout\n" in out
-        assert self.tool_names(assistant.created[0]["tools"]) == ["set_timer", "shout"]
-
-    def test_no_tools(self, dataset_dir, tmp_path, fake_load, assistant, typed, load_calls, capsys):
-        typed("a")
-        code, out, _ = run(self.chat_args(dataset_dir, tmp_path, "--no-tools"), capsys)
-        assert code == 0
-        assert load_calls == []
-        assert assistant.created[0]["tools"] is None
-        assert "Tools:" not in out
-        assert "Herald: First reply." in out  # a plain chat
-
-    @pytest.mark.parametrize(
-        ("extra", "use_triggers"),
-        [
-            ([], True),  # a tool with trigger words is only offered when one of them is said
-            (["--always-offer-tools"], False),
-            (["--no-tools", "--always-offer-tools"], False),  # harmless without tools
-        ],
-    )
-    def test_always_offer_tools(
-        self, extra, use_triggers, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        typed()
-        code, _, _ = run(self.chat_args(dataset_dir, tmp_path, *extra), capsys)
-        assert code == 0
-        assert assistant.created[0]["use_triggers"] is use_triggers
-
-    def test_no_tools_found_means_no_registry_and_no_line(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, monkeypatch, capsys
-    ):
-        import herald.tools
-
-        nothing = LoadReport(ToolRegistry(), (), ())
-        monkeypatch.setattr(herald.tools, "load_tools", lambda user_dir, context, **kw: nothing)
-        typed()
-        code, out, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 0
-        assert assistant.created[0]["tools"] is None
-        assert "Tools:" not in out and "warning" not in err
-
-    def test_a_broken_tool_script_is_a_warning_not_the_end_of_the_chat(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, capsys
-    ):
-        tools_dir = tmp_path / "mine"
-        tools_dir.mkdir()
-        (tools_dir / "broken.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
-        (tools_dir / "shout.py").write_text(SHOUT_TOOL, encoding="utf-8")
-        typed("a")
-        code, out, err = run(
-            self.chat_args(dataset_dir, tmp_path, "--tools-dir", str(tools_dir)), capsys
-        )
-        assert code == 0
-        assert err.count("warning: tools: ") == 1 and "boom" in err
-        assert "Tools: set_timer, shout\n" in out  # the good ones still load
-        assert "Herald: First reply." in out
-
-    @pytest.fixture
-    def scheduler(self, monkeypatch, scratch_root):
-        """A Scheduler that records its shutdown instead of running timers."""
-        import herald.tools.scheduler
-
-        seen = SimpleNamespace(shutdowns=0, pending=0, scratch_when_stopped=None)
-
-        class FakeScheduler:
-            def shutdown(self):
-                seen.shutdowns += 1
-                seen.scratch_when_stopped = any(scratch_root.iterdir())
-                return seen.pending
-
-        monkeypatch.setattr(herald.tools.scheduler, "Scheduler", FakeScheduler)
-        return seen
-
-    def test_timers_are_cancelled_when_the_chat_ends(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
-    ):
-        scheduler.pending = 2
-        typed("a", "")
-        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 0
-        assert scheduler.shutdowns == 1
-        assert (
-            "2 timer(s) were still running and have been cancelled because the chat ended." in err
-        )
-        # The timers go first: none can fire into the scratch directory once it is removed.
-        assert scheduler.scratch_when_stopped is True
-
-    def test_no_message_when_no_timer_was_running(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
-    ):
-        typed()
-        _, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert scheduler.shutdowns == 1
-        assert "timer(s)" not in err
-
-    def test_timers_are_cancelled_on_ctrl_c_too(
-        self, dataset_dir, tmp_path, fake_load, assistant, scheduler, monkeypatch, capsys
-    ):
-        scheduler.pending = 1
-
-        def interrupted(prompt=""):
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr("builtins.input", interrupted)
-        code, _, err = run(self.chat_args(dataset_dir, tmp_path), capsys)
-        assert code == 130
-        assert scheduler.shutdowns == 1
-        assert "1 timer(s) were still running" in err
-
-    def test_no_scheduler_without_tools(
-        self, dataset_dir, tmp_path, fake_load, assistant, typed, scheduler, capsys
-    ):
-        typed()
-        run(self.chat_args(dataset_dir, tmp_path, "--no-tools"), capsys)
-        assert scheduler.shutdowns == 0
-
-    # --- alerts (what a timer says) ------------------------------------------------------------
-
-    def chat_voice(self, dataset_dir, tmp_path, stack, *extra):
-        """The speaker and the announcer of a chat, built like ``herald chat`` builds them."""
-        settings = Settings.from_env()
-        argv = ["chat", *voice_args(dataset_dir, tmp_path), *extra]
-        args = cli.build_parser(settings).parse_args(argv)
-        speak = cli._make_speaker(args, settings, stack)
-        return speak, cli._make_announcer(speak)
-
-    def test_an_alert_is_printed_and_spoken_once(
-        self, dataset_dir, tmp_path, fake_load, mocker, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav", return_value=True)
-        with contextlib.ExitStack() as stack:
-            _, announce = self.chat_voice(dataset_dir, tmp_path, stack)
-            announce("Your tea is ready.")
-        out = capsys.readouterr().out
-        assert out == "\a\n[Herald] Your tea is ready.\n"  # with a terminal bell
-        assert [c["text"] for c in fake_load.calls] == ["Your tea is ready."]
-        assert play.call_count == 1
-
-    def test_a_text_only_chat_prints_the_alert_and_does_not_speak(
-        self, dataset_dir, tmp_path, fake_load, mocker, capsys
-    ):
-        play = mocker.patch("herald.audio_playback.play_wav")
-        with contextlib.ExitStack() as stack:
-            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack, "--no-play")
-            assert speak is None
-            announce("Your tea is ready.")
-        assert "[Herald] Your tea is ready." in capsys.readouterr().out
-        assert fake_load.load_calls == [] and fake_load.calls == []
-        play.assert_not_called()
-
-    def test_a_failed_alert_is_reported_and_never_raises(
-        self, dataset_dir, tmp_path, fake_load, capsys
-    ):
-        def broken(text, pause_ms, max_chars):
-            raise RuntimeError("model exploded")
-
-        fake_load.synth_long = broken
-        with contextlib.ExitStack() as stack:
-            _, announce = self.chat_voice(dataset_dir, tmp_path, stack)
-            announce("Your tea is ready.")  # must not raise: it runs on a timer thread
-        captured = capsys.readouterr()
-        assert "[Herald] Your tea is ready." in captured.out  # the text still gets through
-        assert "error: could not speak the reply: model exploded" in captured.err
-
-    def test_alerts_are_saved_next_to_the_replies(self, dataset_dir, tmp_path, fake_load, capsys):
-        with contextlib.ExitStack() as stack:
-            speak, announce = self.chat_voice(
-                dataset_dir, tmp_path, stack, *self.keep(tmp_path), "--no-play"
-            )
-            announce("First alert.")
-            speak("A reply.", "chat", 1)
-            announce("Second alert.")
-        names = sorted(p.name for p in (tmp_path / "wavs").iterdir())
-        assert [n.split("_")[0] + n[-8:] for n in names] == [
-            "alert_001.wav",
-            "alert_002.wav",
-            "chat_001.wav",
-        ]
-
-    def test_replies_and_alerts_never_overlap(self, dataset_dir, tmp_path, fake_load, capsys):
-        """Two alerts (timer threads) and a reply (main thread) all want the voice at once."""
-        guard = threading.Lock()
-        state = SimpleNamespace(active=0, peak=0, calls=0)
-        first_in, second_in, release = threading.Event(), threading.Event(), threading.Event()
-
-        def synth(text, pause_ms, max_chars):
-            with guard:
-                state.active += 1
-                state.peak = max(state.peak, state.active)
-                state.calls += 1
-                (first_in if state.calls == 1 else second_in).set()
-            release.wait(5)
-            with guard:
-                state.active -= 1
-            return np.zeros(10, dtype=np.float32)
-
-        fake_load.synth_long = synth
-        with contextlib.ExitStack() as stack:
-            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack)
-            threads = [
-                threading.Thread(target=announce, args=("alert one",)),
-                threading.Thread(target=announce, args=("alert two",)),
-                threading.Thread(target=speak, args=("a reply", "chat", 1)),
-            ]
-            threads[0].start()
-            assert first_in.wait(5)
-            threads[1].start()
-            threads[2].start()
-            # While the first utterance is being made, nobody else gets to make theirs.
-            assert not second_in.wait(0.3)
-            release.set()
-            for thread in threads:
-                thread.join(5)
-        assert (state.calls, state.peak) == (3, 1)
-
-    def test_ending_the_chat_lets_the_utterance_in_progress_finish_and_drops_later_ones(
-        self, dataset_dir, tmp_path, fake_load, capsys
-    ):
-        state = SimpleNamespace(active=0)
-        started, release = threading.Event(), threading.Event()
-
-        def synth(text, pause_ms, max_chars):
-            state.active += 1
-            started.set()
-            release.wait(5)
-            state.active -= 1
-            return np.zeros(10, dtype=np.float32)
-
-        fake_load.synth_long = synth
-        with contextlib.ExitStack() as stack:
-            speak, announce = self.chat_voice(dataset_dir, tmp_path, stack)
-            alert = threading.Thread(target=announce, args=("Too late?",))
-            alert.start()
-            assert started.wait(5)
-            threading.Timer(0.2, release.set).start()
-        # Leaving the with block waited for the alert to be spoken (the scratch directory
-        # is only removed after that)...
-        assert state.active == 0
-        alert.join(5)
-        # ...and from now on nothing is spoken any more.
-        calls = len(fake_load.calls)
-        speak("Anything.", "chat", 9)
-        announce("Anything else.")
-        assert len(fake_load.calls) == calls
-
-    def test_a_timer_speaks_while_the_chat_waits_for_input(
-        self, dataset_dir, tmp_path, fake_load, mocker, monkeypatch, capsys
-    ):
-        """End to end: real Assistant, real tools, real Scheduler; only the LLM HTTP call, the
-        voice model and the terminal are fake."""
-
-        def tool_call_reply():
-            call = {
-                "function": {"name": "set_timer", "arguments": {"seconds": 1, "message": "Tea."}}
-            }
-            return {"message": {"role": "assistant", "content": "", "tool_calls": [call]}}
-
-        def text_reply(text):
-            return {"message": {"role": "assistant", "content": text}}
-
-        def http(body):
-            return SimpleNamespace(ok=True, status_code=200, json=lambda: body, text=str(body))
-
-        post = mocker.patch(
-            "requests.post",
-            side_effect=[http(tool_call_reply()), http(text_reply("Timer set."))],
-        )
-        alert_spoken = threading.Event()
-        real_synth = fake_load.synth_long
-
-        def synth(text, pause_ms, max_chars):
-            wav = real_synth(text, pause_ms, max_chars)
-            if text == "Tea.":
-                alert_spoken.set()
-            return wav
-
-        fake_load.synth_long = synth
-        lines = iter(["Set a one second timer for tea."])
-
-        def input_then_wait(prompt=""):
-            try:
-                return next(lines)
-            except StopIteration:
-                # The main thread sits in input() while the timer thread fires, like a real chat.
-                assert alert_spoken.wait(10), "the timer never spoke"
-                return ""
-
-        monkeypatch.setattr("builtins.input", input_then_wait)
-
-        code, out, err = run(["chat", *voice_args(dataset_dir, tmp_path)], capsys)
-
-        assert code == 0
-        assert "Tools: set_timer" in out
-        assert "Herald: Timer set." in out
-        assert "[Herald] Tea." in out  # printed by the timer thread...
-        assert [c["text"] for c in fake_load.calls] == ["Timer set.", "Tea."]  # ...and spoken
-        assert "timer(s)" not in err  # it had already fired when the chat ended
-        assert post.call_count == 2
 
 
 # --- slim ---------------------------------------------------------------------------------------
@@ -1672,6 +1118,461 @@ class TestTools:
         monkeypatch.setattr(herald.tools.scheduler, "Scheduler", FakeScheduler)
         run(["tools"], capsys)
         assert stopped == [True]
+
+
+# --- profiles -----------------------------------------------------------------------------------
+
+
+class TestProfileDefaults:
+    """``--profile``: command line > profile > environment > built-in default."""
+
+    def test_the_profile_supplies_the_defaults_of_its_options(self, tmp_path, handled, capsys):
+        make_profile(
+            tmp_path,
+            "mario",
+            """
+            language = "it"
+            temperature = 0.3
+            device = "cpu"
+            num_references = 2
+            ollama_model = "mistral"
+            history = 4
+            system_prompt = "Be Mario."
+            """,
+        )
+        code, _, _ = run(["chat", "--profile", "mario"], capsys)
+        assert code == 0
+        (args,) = handled.args
+        assert (args.language, args.temperature, args.device) == ("it", 0.3, "cpu")
+        assert (args.num_references, args.ollama_model, args.history) == (2, "mistral", 4)
+        assert args.system_prompt == "Be Mario."
+
+    def test_the_command_line_beats_the_profile(self, tmp_path, handled, capsys):
+        make_profile(
+            tmp_path,
+            "mario",
+            'language = "it"\nollama_model = "mistral"\nsystem_prompt = "Be Mario."\n',
+        )
+        argv = ["chat", "--profile", "mario", "--language", "en", "--ollama-model", "phi"]
+        run([*argv, "--system-prompt", "Be Luigi."], capsys)
+        (args,) = handled.args
+        assert (args.language, args.ollama_model) == ("en", "phi")
+        assert args.system_prompt == "Be Luigi."
+
+    def test_the_profile_beats_the_environment_which_beats_the_built_in_default(
+        self, tmp_path, handled, monkeypatch, capsys
+    ):
+        make_profile(tmp_path, "mario", 'language = "it"\n')
+        monkeypatch.setenv("HERALD_LANGUAGE", "de")  # the profile has a language: it wins
+        monkeypatch.setenv("HERALD_DEVICE", "cpu")  # the profile has none: the environment does
+        monkeypatch.setenv("HERALD_OLLAMA_MODEL", "phi")
+        monkeypatch.setenv("HERALD_SYSTEM_PROMPT", "From the environment.")
+        run(["chat", "--profile", "mario"], capsys)
+        (args,) = handled.args
+        assert (args.language, args.device) == ("it", "cpu")
+        assert (args.ollama_model, args.system_prompt) == ("phi", "From the environment.")
+        assert (args.temperature, args.history) == (0.7, 10)  # nobody said: built-in
+
+    def test_a_system_prompt_file_on_the_command_line_still_wins(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario", 'system_prompt = "Be Mario."\n')
+        prompt = tmp_path / "prompt.txt"
+        prompt.write_text("Be Luigi.", encoding="utf-8")
+        code, _, _ = run(
+            ["chat", "--profile", "mario", "--system-prompt-file", str(prompt)], capsys
+        )
+        assert code == 0  # not a clash: the profile only sets the default of --system-prompt
+        (args,) = handled.args
+        assert args.system_prompt_file == prompt  # and chat reads the file in preference
+
+    def test_a_profile_may_keep_its_character_in_a_file(self, tmp_path, handled, capsys):
+        (tmp_path / "project").mkdir(exist_ok=True)
+        (tmp_path / "project" / "mario.md").write_text("  Be Mario.\n", encoding="utf-8")
+        make_profile(tmp_path, "mario", 'system_prompt_file = "mario.md"\n')
+        run(["chat", "--profile", "mario"], capsys)
+        assert handled.args[0].system_prompt == "Be Mario."
+
+    def test_keys_the_command_does_not_have_are_ignored(self, tmp_path, handled, capsys):
+        make_profile(
+            tmp_path,
+            "mario",
+            'language = "it"\nsystem_prompt = "Be Mario."\nollama_model = "mistral"\n'
+            'history = 3\nspeaker_name = "mario"\ntemperature = 0.2\n',
+        )
+        code, _, err = run(["synthesize", "Hi.", "--profile", "mario"], capsys)
+        assert code == 0 and "error" not in err
+        (args,) = handled.args
+        assert (args.language, args.temperature) == ("it", 0.2)
+        assert not hasattr(args, "system_prompt") and not hasattr(args, "ollama_model")
+
+    def test_train_takes_the_dataset_language_and_speaker_from_the_profile(
+        self, tmp_path, handled, capsys
+    ):
+        make_profile(
+            tmp_path,
+            "mario",
+            'dataset = "dataset/mario"\nlanguage = "it"\nspeaker_name = "mario"\n'
+            'checkpoint = "models/not_trained_yet"\ndevice = "cpu"\n',
+        )
+        code, _, err = run(["train", "--profile", "mario"], capsys)
+        assert code == 0  # train does not check the checkpoint: it is about to create it
+        (args,) = handled.args
+        assert args.dataset_dir == tmp_path / "project" / "dataset" / "mario"
+        assert (args.language, args.speaker_name) == ("it", "mario")
+        assert not hasattr(args, "checkpoint")
+        assert "Profile: mario (profiles/mario.toml)" in err
+
+    def test_the_environment_selects_a_profile_too_and_the_option_beats_it(
+        self, tmp_path, handled, monkeypatch, capsys
+    ):
+        make_profile(tmp_path, "mario", 'language = "it"\n')
+        make_profile(tmp_path, "luigi", 'language = "es"\n')
+        monkeypatch.setenv("HERALD_PROFILE", "mario")
+        run(["chat"], capsys)
+        run(["chat", "--profile", "luigi"], capsys)
+        assert [a.language for a in handled.args] == ["it", "es"]
+
+    def test_a_profile_can_be_given_as_a_path(self, tmp_path, handled, capsys):
+        elsewhere = tmp_path / "elsewhere.toml"
+        elsewhere.write_text('language = "it"\n', encoding="utf-8")
+        code, _, err = run(["chat", "--profile", str(elsewhere)], capsys)
+        assert code == 0
+        assert handled.args[0].language == "it"
+        assert "Profile: elsewhere" in err
+
+    def test_a_reference_list_from_the_profile_is_replaced_not_extended(
+        self, tmp_path, handled, capsys
+    ):
+        for name in ("a.wav", "b.wav", "mine.wav"):
+            (tmp_path / "project").mkdir(exist_ok=True)
+            (tmp_path / "project" / name).write_bytes(b"RIFF")
+        make_profile(tmp_path, "mario", 'reference_wavs = ["a.wav", "b.wav"]\n')
+        run(["synthesize", "Hi.", "--profile", "mario"], capsys)
+        run(["synthesize", "Hi.", "--profile", "mario", "--reference-wav", "mine.wav"], capsys)
+        run(["synthesize", "Hi."], capsys)
+        project = tmp_path / "project"
+        assert handled.args[0].reference_wav == [project / "a.wav", project / "b.wav"]
+        assert handled.args[1].reference_wav == [Path("mine.wav")]  # replaced, not extended
+        assert handled.args[2].reference_wav is None  # no profile: as before
+
+    def test_the_profile_is_announced(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario")
+        _, out, err = run(["synthesize", "Hi.", "--profile", "mario"], capsys)
+        assert "Profile: mario (profiles/mario.toml)\n" in err
+        assert "Profile" not in out  # stdout is for results
+        _, _, err = run(["synthesize", "Hi."], capsys)
+        assert "Profile" not in err
+
+    def test_the_profile_reaches_the_voice(self, dataset_dir, tmp_path, fake_load, capsys):
+        voice = tmp_path / "project" / "models" / "mario.pth"
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b"x")
+        make_profile(
+            tmp_path,
+            "mario",
+            f'checkpoint = "models/mario.pth"\ndataset = "{dataset_dir}"\nlanguage = "it"\n'
+            "num_references = 2\n",
+        )
+        argv = ["synthesize", "Hi.", "--profile", "mario", "-o", str(tmp_path / "o.wav")]
+        code, _, _ = run([*argv, "--checkpoint-dir", str(tmp_path / "ckpt")], capsys)
+        assert code == 0
+        (call,) = fake_load.load_calls
+        assert call["finetuned_checkpoint"] == voice
+        assert call["language"] == "it"
+        assert len(call["reference_wavs"]) == 2
+        assert all(str(dataset_dir) in wav for wav in call["reference_wavs"])
+
+
+class TestProfileErrors:
+    @pytest.mark.parametrize("command", ["synthesize", "chat", "train"])
+    def test_a_missing_profile_is_a_one_line_error_before_anything_happens(
+        self, command, tmp_path, handled, capsys
+    ):
+        make_profile(tmp_path, "frieren")
+        code, out, err = run([command, "--profile", "nope"], capsys)
+        assert code == 1
+        assert err.count("\n") == 1 and "Profile 'nope' not found" in err
+        assert "frieren" in err  # it says which profiles exist
+        assert handled.args == [] and out == ""
+
+    def test_a_broken_profile_names_its_file(self, tmp_path, handled, capsys):
+        path = make_profile(tmp_path, "mario", "language = it\n")  # not TOML
+        code, _, err = run(["chat", "--profile", "mario"], capsys)
+        assert code == 1 and str(path) in err and "Traceback" not in err
+        assert handled.args == []
+
+    def test_a_typo_in_a_profile_is_an_error(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario", 'languge = "it"\n')
+        code, _, err = run(["chat", "--profile", "mario"], capsys)
+        assert code == 1 and "languge" in err and "language" in err
+
+    @pytest.mark.parametrize("argv", [["--help"], ["chat", "--help"], ["synthesize", "--help"]])
+    def test_help_works_with_a_broken_profile(self, argv, tmp_path, monkeypatch, capsys):
+        make_profile(tmp_path, "mario", "this is not toml")
+        monkeypatch.setenv("HERALD_PROFILE", "mario")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(argv)
+        assert exc.value.code == 0
+        out, err = capsys.readouterr()
+        assert "usage: herald" in out and err == ""
+
+    def test_help_works_with_a_missing_profile_option(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["chat", "--profile", "nope", "--help"])
+        assert exc.value.code == 0
+        assert "usage: herald chat" in capsys.readouterr().out
+
+    def test_help_shows_the_defaults_of_a_valid_profile(self, tmp_path, capsys):
+        make_profile(tmp_path, "mario", 'language = "it"\nollama_model = "mistral"\n')
+        with pytest.raises(SystemExit):
+            cli.main(["chat", "--profile", "mario", "--help"])
+        out = capsys.readouterr().out
+        assert "(default: it)" in out and "(default: mistral)" in out
+
+    def test_a_missing_value_for_the_option_is_a_usage_error(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["chat", "--profile"])
+        assert exc.value.code == 2
+
+    def test_other_commands_do_not_look_at_a_broken_profile(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HERALD_PROFILE", "nope")
+        code, out, err = run(["tools"], capsys)
+        assert code == 0 and "set_timer" in out and "nope" not in err
+        code, _, err = run(["slim", str(tmp_path / "x.pth")], capsys)
+        assert "Profile" not in err  # its own error, not a profile one
+
+    def test_empty_profile_option_means_no_profile(self, tmp_path, handled, monkeypatch, capsys):
+        monkeypatch.setenv("HERALD_PROFILE", "nope")
+        code, _, _ = run(["chat", "--profile", ""], capsys)
+        assert code == 0
+
+
+class TestProfileChecks:
+    """A profile that points to files that are not there fails early, with one error each."""
+
+    def test_missing_files_are_reported_one_per_line(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario", 'checkpoint = "models/mario"\ndataset = "dataset/mario"\n')
+        code, _, err = run(["chat", "--profile", "mario"], capsys)
+        assert code == 1
+        lines = [line for line in err.splitlines() if line.startswith("error:")]
+        assert len(lines) == 2
+        assert "profile mario: checkpoint not found" in lines[0]
+        assert "profile mario: dataset directory not found" in lines[1]
+        assert handled.args == []  # nothing ran
+
+    def test_synthesize_checks_too(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario", 'checkpoint = "models/mario"\n')
+        code, _, err = run(["synthesize", "Hi.", "--profile", "mario"], capsys)
+        assert code == 1 and "checkpoint not found" in err
+
+    def test_an_explicit_checkpoint_makes_the_profile_checkpoint_moot(
+        self, tmp_path, handled, capsys
+    ):
+        make_profile(tmp_path, "mario", 'checkpoint = "models/mario"\n')
+        code, _, err = run(["chat", "--profile", "mario", "--checkpoint", "mine"], capsys)
+        assert code == 0 and "error" not in err
+        assert handled.args[0].checkpoint == Path("mine")
+
+    def test_an_explicit_dataset_dir_makes_the_profile_dataset_moot(
+        self, tmp_path, handled, capsys
+    ):
+        make_profile(tmp_path, "mario", 'dataset = "dataset/mario"\n')
+        code, _, _ = run(["chat", "--profile", "mario", "--dataset-dir", str(tmp_path)], capsys)
+        assert code == 0
+
+    def test_explicit_reference_clips_make_the_profile_clips_and_dataset_moot(
+        self, tmp_path, handled, capsys
+    ):
+        make_profile(tmp_path, "mario", 'reference_wavs = ["gone.wav"]\ndataset = "dataset/gone"\n')
+        code, _, _ = run(["chat", "--profile", "mario"], capsys)
+        assert code == 1  # without the option, both are missing
+        code, _, err = run(["chat", "--profile", "mario", "--reference-wav", "mine.wav"], capsys)
+        assert code == 0 and "error" not in err
+
+    def test_other_problems_still_count_when_one_is_moot(self, tmp_path, handled, capsys):
+        make_profile(tmp_path, "mario", 'checkpoint = "models/mario"\ndataset = "dataset/gone"\n')
+        code, _, err = run(["chat", "--profile", "mario", "--checkpoint", "mine"], capsys)
+        assert code == 1
+        assert "dataset directory not found" in err and "checkpoint not found" not in err
+
+    def test_a_valid_profile_passes(self, dataset_dir, tmp_path, handled, capsys):
+        voice = tmp_path / "project" / "models" / "mario"
+        voice.mkdir(parents=True)
+        (voice / "best_model.pth").write_bytes(b"x")
+        make_profile(tmp_path, "mario", f'checkpoint = "models/mario"\ndataset = "{dataset_dir}"\n')
+        code, _, err = run(["chat", "--profile", "mario"], capsys)
+        assert code == 0 and "error" not in err
+
+
+class TestProfilesCommand:
+    def test_lists_every_profile_with_its_problems(self, dataset_dir, tmp_path, capsys):
+        voice = tmp_path / "project" / "models" / "ok"
+        voice.mkdir(parents=True)
+        (voice / "best_model.pth").write_bytes(b"x")
+        make_profile(
+            tmp_path,
+            "ok",
+            'description = "A fine voice"\nlanguage = "it"\ncheckpoint = "models/ok"\n',
+        )
+        make_profile(tmp_path, "plain", 'description = "The base voice"\n')
+        make_profile(tmp_path, "broken", 'checkpoint = "models/gone"\n')
+        make_profile(tmp_path, "_template", 'description = "not listed"\n')
+        code, out, err = run(["profiles"], capsys)
+        assert code == 0 and err == ""
+        lines = out.splitlines()
+        row = {
+            name: next(line for line in lines if f" {name} " in f" {line} ")
+            for name in ("ok", "plain", "broken")
+        }
+        assert row["ok"].startswith("  ") and "it" in row["ok"]
+        assert "models/ok" in row["ok"] and "A fine voice" in row["ok"]
+        assert "base voice" in row["plain"] and row["plain"].startswith("  ")
+        assert row["broken"].startswith("! ")  # flagged...
+        assert any("checkpoint not found" in line and "!" in line for line in lines)  # ...and why
+        assert "_template" not in out and "not listed" not in out
+
+    def test_no_profiles(self, capsys):
+        code, out, _ = run(["profiles"], capsys)
+        assert code == 0
+        assert "No profiles in" in out and "herald new-profile NAME" in out
+
+    def test_shows_one_profile_with_its_resolved_values(self, tmp_path, capsys):
+        make_profile(
+            tmp_path,
+            "mario",
+            'description = "Mario"\ncheckpoint = "models/mario"\nlanguage = "it"\n'
+            'system_prompt = "Line one.\\nLine two."\nreference_wavs = ["a.wav", "b.wav"]\n',
+        )
+        code, out, _ = run(["profiles", "mario"], capsys)
+        assert code == 0
+        assert out.splitlines()[0] == "mario  (profiles/mario.toml)"
+        assert "  checkpoint: models/mario" in out  # shown relative to the project
+        assert "  language: it" in out
+        assert "  reference_wavs: a.wav, b.wav" in out
+        assert "  system_prompt: Line one.\n    Line two." in out
+        assert "  ! checkpoint not found" in out  # the problems come with it, exit code still 0
+
+    def test_a_profile_without_checkpoint_is_the_base_voice(self, tmp_path, capsys):
+        make_profile(tmp_path, "plain")
+        _, out, _ = run(["profiles", "plain"], capsys)
+        assert "voice: base voice" in out
+
+    def test_an_unknown_or_broken_profile_is_exit_1(self, tmp_path, capsys):
+        make_profile(tmp_path, "mario", "nonsense")
+        code, _, err = run(["profiles", "nope"], capsys)
+        assert code == 1 and "Profile 'nope' not found" in err
+        code, _, err = run(["profiles", "mario"], capsys)
+        assert code == 1 and "invalid TOML" in err
+
+    def test_the_directory_comes_from_the_environment(self, tmp_path, monkeypatch, capsys):
+        folder = tmp_path / "mine"
+        folder.mkdir()
+        (folder / "x.toml").write_text('description = "X"\n', encoding="utf-8")
+        monkeypatch.setenv("HERALD_PROFILES_DIR", str(folder))
+        _, out, _ = run(["profiles"], capsys)
+        assert " x " in f" {out} "
+
+
+class TestNewProfile:
+    def written(self, tmp_path, name="mario"):
+        return tomllib.loads(
+            (tmp_path / "project" / "profiles" / f"{name}.toml").read_text(encoding="utf-8")
+        )
+
+    def test_writes_what_was_given_with_paths_relative_to_the_project(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        project = tmp_path / "project"
+        monkeypatch.chdir(tmp_path)  # not the project: paths are typed from where you are
+        code, out, err = run(
+            [
+                "new-profile", "mario",
+                "--description", "Mario, the plumber",
+                "--checkpoint", "project/models/mario",
+                "--dataset", str(project / "dataset" / "mario"),
+                "--reference-wav", "project/clips/a.wav",
+                "--reference-wav", "/somewhere/else/b.wav",
+                "--language", "it",
+                "--system-prompt", "You are Mario.",
+                "--ollama-model", "mistral",
+            ],
+            capsys,
+        )  # fmt: skip
+        assert code == 0
+        assert self.written(tmp_path) == {
+            "description": "Mario, the plumber",
+            "checkpoint": "models/mario",
+            "dataset": "dataset/mario",
+            "reference_wavs": ["clips/a.wav", "/somewhere/else/b.wav"],  # outside: as it is
+            "language": "it",
+            "system_prompt": "You are Mario.",
+            "ollama_model": "mistral",
+        }
+        assert out.splitlines() == [
+            "Created profiles/mario.toml",
+            "Use it with: herald chat --profile mario",
+        ]
+        # The files it points to do not exist yet: said, but not a failure.
+        assert "warning: checkpoint not found" in err
+
+    def test_only_the_given_options_are_written(self, tmp_path, capsys):
+        code, out, _ = run(["new-profile", "plain", "--language", "en"], capsys)
+        assert code == 0
+        assert self.written(tmp_path, "plain") == {"language": "en"}
+
+    def test_the_new_profile_can_be_used_at_once(self, tmp_path, handled, capsys):
+        run(["new-profile", "mario", "--language", "it", "--ollama-model", "mistral"], capsys)
+        code, _, _ = run(["chat", "--profile", "mario"], capsys)
+        assert code == 0
+        assert (handled.args[0].language, handled.args[0].ollama_model) == ("it", "mistral")
+
+    def test_the_system_prompt_can_come_from_a_file(self, tmp_path, monkeypatch, capsys):
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "mario.md").write_text("Be Mario.", encoding="utf-8")
+        monkeypatch.chdir(project)
+        code, _, _ = run(["new-profile", "mario", "--system-prompt-file", "mario.md"], capsys)
+        assert code == 0
+        assert self.written(tmp_path) == {"system_prompt_file": "mario.md"}
+
+    def test_a_missing_system_prompt_file_is_an_error(self, tmp_path, capsys):
+        code, _, err = run(
+            ["new-profile", "mario", "--system-prompt-file", str(tmp_path / "gone.md")], capsys
+        )
+        assert code == 1 and "gone.md" in err
+        assert not (tmp_path / "project" / "profiles" / "mario.toml").exists()
+
+    def test_the_two_ways_to_give_the_character_exclude_each_other(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["new-profile", "m", "--system-prompt", "x", "--system-prompt-file", "y"])
+        assert exc.value.code == 2
+
+    def test_it_does_not_replace_a_profile_unless_forced(self, tmp_path, capsys):
+        run(["new-profile", "mario", "--language", "it"], capsys)
+        code, _, err = run(["new-profile", "mario", "--language", "es"], capsys)
+        assert code == 1
+        assert "profiles/mario.toml already exists" in err and "--force" in err
+        assert self.written(tmp_path) == {"language": "it"}  # untouched
+
+        code, out, _ = run(["new-profile", "mario", "--language", "es", "--force"], capsys)
+        assert code == 0 and out.startswith("Replaced profiles/mario.toml")
+        assert self.written(tmp_path) == {"language": "es"}
+
+    @pytest.mark.parametrize("name", ["bad name", "a/b", "a.b", "été", "x:y"])
+    def test_names_are_letters_digits_dash_and_underscore(self, name, tmp_path, capsys):
+        code, _, err = run(["new-profile", name], capsys)
+        assert code == 1 and "Invalid profile name" in err
+        assert not (tmp_path / "project" / "profiles").exists()
+
+    def test_the_directory_comes_from_the_environment(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HERALD_PROFILES_DIR", str(tmp_path / "mine"))
+        code, out, _ = run(["new-profile", "mario"], capsys)
+        assert code == 0
+        assert (tmp_path / "mine" / "mario.toml").is_file()
+
+    def test_a_name_is_required(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["new-profile"])
+        assert exc.value.code == 2
 
 
 # --- download-checkpoints ------------------------------------------------------------------------

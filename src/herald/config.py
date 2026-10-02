@@ -43,7 +43,9 @@ class Settings:
     runs_dir: Path
     output_dir: Path
     tools_dir: Path  # your own tool scripts (*.py) for the chat assistant
+    profiles_dir: Path  # voice profiles: <profiles_dir>/<name>.toml
     checkpoint: Path | None = None  # fine-tuned checkpoint (file or run directory) to speak with
+    profile: str | None = None  # name or path of the profile to use when --profile is not given
     checkpoint_url: str = DEFAULT_CHECKPOINT_URL
     device: str = "auto"
     language: str = "en"
@@ -84,7 +86,9 @@ class Settings:
             runs_dir=get_path("RUNS_DIR") or root / paths.DEFAULT_RUNS_SUBDIR,
             output_dir=get_path("OUTPUT_DIR") or root / paths.DEFAULT_OUTPUT_SUBDIR,
             tools_dir=get_path("TOOLS_DIR") or root / paths.DEFAULT_TOOLS_SUBDIR,
+            profiles_dir=get_path("PROFILES_DIR") or root / paths.DEFAULT_PROFILES_SUBDIR,
             checkpoint=get_path("CHECKPOINT"),
+            profile=get("PROFILE"),
             checkpoint_url=get("CHECKPOINT_URL") or DEFAULT_CHECKPOINT_URL,
             device=get("DEVICE") or "auto",
             language=get("LANGUAGE") or "en",
@@ -105,3 +109,11 @@ def _parse_timeout(raw: str | None) -> float:
     if value <= 0:
         raise ConfigError(f"{ENV_PREFIX}OLLAMA_TIMEOUT must be positive, got {raw!r}")
     return value
+
+
+def read_utf8(path: Path) -> str:
+    """Read a UTF-8 text file; a BOM (Windows Notepad adds one) is dropped."""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path} is not a UTF-8 text file") from None

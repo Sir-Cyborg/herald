@@ -1,0 +1,65 @@
+# A voice profile: one file that bundles a voice and its character.
+#
+# Copy this file to a name without the underscore (for example `mario.toml`), keep the lines you
+# need and delete the rest, then use it:
+#
+#   herald chat --profile mario
+#   herald synthesize "Hello." --profile mario
+#   herald profiles                      # lists every profile and flags what is missing
+#
+# Or let Herald write one for you:
+#
+#   herald new-profile mario --checkpoint models/mario --dataset dataset/mario --language it
+#
+# `herald train` also creates a profile for the voice it has just trained.
+#
+# Rules
+#   - Every line is optional. A missing line means "use Herald's normal setting".
+#   - Relative paths start from the project folder (not from where you run herald, and not from
+#     this folder). `~` works too.
+#   - Precedence: an option you type on the command line wins over the profile, which wins over
+#     environment variables (HERALD_*), which win over the built-in defaults.
+#   - A misspelled key is an error, so typos do not go unnoticed.
+#   - Files that start with `_` are ignored by `herald profiles`.
+
+# Shown by `herald profiles`.
+description = "My voice"
+
+# --- The voice -------------------------------------------------------------------------------
+
+# A fine-tuned voice: a model file, or the folder that holds best_model.pth.
+# Leave it out to use the base XTTS-v2 voice.
+checkpoint = "models/mario"
+
+# The voice is cloned from a few short clips. Either pick them from a dataset folder
+# (the ones listed in its metadata.csv)...
+dataset = "dataset/mario"
+# num_references = 3
+
+# ...or name the clips yourself (this replaces the dataset for picking references):
+# reference_wavs = ["clips/mario_1.wav", "clips/mario_2.wav"]
+
+# The language the voice speaks (en es fr de it pt pl tr ru nl cs ar zh-cn hu ko ja hi).
+language = "en"
+
+# Higher is more varied, lower is steadier.
+# temperature = 0.7
+
+# auto, cpu, mps, cuda or cuda:N
+# device = "auto"
+
+# --- The character and the brain ---------------------------------------------------------------
+
+# Who the assistant is. Write it in the language you want it to answer in.
+system_prompt = "You are a friendly assistant. Keep answers short, since they are spoken aloud."
+# Or keep a long prompt in its own file (use one of the two, not both):
+# system_prompt_file = "profiles/mario.md"
+
+# The Ollama model that does the thinking, and how many past exchanges it remembers.
+# ollama_model = "llama3.2:3b"
+# history = 10
+
+# --- Training ----------------------------------------------------------------------------------
+
+# The name `herald train` gives to the voice it trains with this profile.
+# speaker_name = "mario"

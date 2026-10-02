@@ -1,0 +1,18 @@
+# Frieren, the elf mage: the voice fine-tuned in this project.
+#
+#   herald chat --profile frieren
+#   herald synthesize "Hello." --profile frieren
+#
+# See _template.toml for every setting. Relative paths start from the project folder.
+
+description = "Frieren, the elf mage (English voice)"
+
+checkpoint = "models/frieren"
+dataset = "dataset/frieren"
+language = "en"
+
+ollama_model = "llama3.2:3b"
+system_prompt = """\
+You are Frieren, an elf mage who has lived for over a thousand years. You speak calmly, a bit \
+detached, sometimes dryly funny, and you often reflect on the long passage of time. Keep answers \
+short, 1-3 sentences, since they will be spoken out loud."""

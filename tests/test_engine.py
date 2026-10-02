@@ -326,6 +326,58 @@ class TestSynthesize:
         assert any("real time" in r.getMessage() for r in caplog.records)
 
 
+class TestWarmUp:
+    def test_synthesizes_a_tiny_text_once_and_returns_the_time_spent(self):
+        eng = make_engine()
+        seconds = eng.warm_up()
+        assert eng.model.texts == ["Hi."]
+        assert isinstance(seconds, float) and seconds >= 0
+
+    def test_the_text_can_be_chosen(self):
+        eng = make_engine()
+        eng.warm_up("Warm.")
+        assert eng.model.texts == ["Warm."]
+
+    def test_the_audio_is_discarded_and_the_engine_still_works(self):
+        eng = make_engine()
+        assert eng.warm_up() is not None
+        assert eng.synthesize("After.").shape == (6,)
+
+    def test_a_failure_is_logged_and_swallowed(self, caplog):
+        model = FakeModel()
+        model.inference = lambda **kw: (_ for _ in ()).throw(RuntimeError("no memory"))
+        with caplog.at_level(logging.WARNING, logger=engine.logger.name):
+            seconds = make_engine(model).warm_up()
+        assert seconds == 0.0
+        assert any("Warm-up" in r.getMessage() for r in caplog.records)
+
+    def test_it_goes_through_the_engine_lock(self):
+        eng = make_engine()
+        eng._lock.acquire()
+        done = threading.Event()
+        thread = threading.Thread(target=lambda: (eng.warm_up(), done.set()))
+        thread.start()
+        try:
+            assert not done.wait(0.1)  # blocked behind whoever holds the lock
+            assert eng.model.calls == []
+        finally:
+            eng._lock.release()
+        assert done.wait(5)
+        thread.join(5)
+        assert eng.model.texts == ["Hi."]
+
+
+class TestMakeSilence:
+    def test_is_float32_zeros_of_the_right_length(self):
+        silence = engine.make_silence(10, 1000)
+        assert silence.dtype == np.float32 and len(silence) == 10 and not silence.any()
+
+    def test_a_zero_pause_is_empty_and_a_negative_one_is_rejected(self):
+        assert len(engine.make_silence(0, 24_000)) == 0
+        with pytest.raises(ValueError, match="pause_ms"):
+            engine.make_silence(-1, 24_000)
+
+
 class TestSynthStream:
     TEXT = "Aaaa. Bbbb. Cccc."  # three chunks of 5 characters with max_chars=5
 

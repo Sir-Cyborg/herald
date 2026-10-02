@@ -55,6 +55,8 @@ LANGUAGE_CHAR_LIMITS = {
 _DEVICE_RE = re.compile(r"^(auto|cpu|mps|cuda(:\d+)?)$")
 # A sentence end (. ! ? and friends), any closing quotes or brackets glued to it, then a space.
 _SENTENCE_END = re.compile(r"([.!?…。！？][\"'”’»)\]}）」』]*)\s+")
+# A clause break (, ; : and their CJK forms) with the same attached closers, then a space.
+_CLAUSE_END = re.compile(r"([,;:，；：、][\"'”’»)\]}）」』]*)\s+")
 
 
 # --- pure helpers -------------------------------------------------------------------------
@@ -122,7 +124,111 @@ def split_text(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
     return chunks
 
 
-def _silence(pause_ms: float, sample_rate: int) -> np.ndarray:
+class SentenceBuffer:
+    """Cuts a stream of text deltas (say, from an LLM) into pieces that can be spoken at once.
+
+    ``feed(delta)`` returns the pieces completed so far and ``flush()`` the rest, so the first
+    sentence of a reply can be synthesized while the model is still writing the next. Pieces end
+    at sentence boundaries (see ``_SENTENCE_END``). A sentence counts as complete only once
+    whitespace follows it, because "3." may become "3.14"; ``flush()`` releases a last sentence
+    that the stream ended without whitespace.
+
+    A piece shorter than ``min_chars`` is held and merged with the next sentence, so the voice
+    does not speak in tiny fragments. The first piece after a flush is the exception, because
+    it decides how soon the first sound is heard: it is released as soon as it is a complete
+    sentence of ``first_chars`` characters, or earlier, at the first clause break (a comma,
+    semicolon or colon followed by a space) once the text so far has ``first_clause_chars``
+    characters. The rest of the sentence then goes through the normal rules. ``None`` or 0 for
+    ``first_clause_chars`` turns the clause break off. Pieces never exceed ``max_chars``: a
+    longer sentence is wrapped at word boundaries, as :func:`split_text` does. Whitespace is
+    normalised, and the pieces joined by spaces always give back the whole text, however the
+    deltas were cut.
+
+    Language-agnostic: pass ``max_chars=default_max_chars(language)``. Not thread-safe.
+    """
+
+    def __init__(
+        self,
+        max_chars: int = DEFAULT_MAX_CHARS,
+        min_chars: int = 40,
+        first_chars: int = 12,
+        first_clause_chars: int | None = 24,
+    ) -> None:
+        if max_chars < 1:
+            raise ValueError("max_chars must be at least 1")
+        if min_chars < 0 or first_chars < 0 or (first_clause_chars or 0) < 0:
+            raise ValueError("min_chars, first_chars and first_clause_chars must not be negative")
+        self.max_chars = max_chars
+        self.min_chars = min_chars
+        self.first_chars = first_chars
+        self.first_clause_chars = first_clause_chars or 0
+        self._text = ""  # received, but not yet known to be a complete sentence
+        self._current = ""  # complete sentences waiting to become one piece
+        self._released = False  # whether a piece was returned since the last flush
+
+    def feed(self, delta: str) -> list[str]:
+        """Add ``delta`` to the text and return the pieces that are now complete (often none)."""
+        self._text += delta
+        pieces: list[str] = []
+        start = 0
+        for match in _SENTENCE_END.finditer(self._text):
+            start = self._release_at_clause(start, match.end(1), pieces)
+            self._add_sentence(" ".join(self._text[start : match.end(1)].split()), pieces)
+            start = match.end()
+        start = self._release_at_clause(start, len(self._text), pieces)  # the unfinished sentence
+        self._text = self._text[start:]
+        return pieces
+
+    def flush(self) -> list[str]:
+        """Return everything still held (``[]`` if only whitespace) and start a new text."""
+        pieces: list[str] = []
+        self._add_sentence(" ".join(self._text.split()), pieces)
+        self._release(pieces)
+        self._text = ""
+        self._released = False
+        return pieces
+
+    def _release_at_clause(self, start: int, end: int, pieces: list[str]) -> int:
+        """Release the first piece at a clause break in ``text[start:end]``, if there is one.
+
+        Only before the first piece of a text. Returns where the text goes on: after the
+        clause break if a piece was released, else ``start``.
+        """
+        if self._released or not self.first_clause_chars:
+            return start
+        for match in _CLAUSE_END.finditer(self._text, start, end):
+            piece = " ".join(f"{self._current} {self._text[start : match.end(1)]}".split())
+            if self.first_clause_chars <= len(piece) <= self.max_chars:
+                self._current = ""
+                pieces.append(piece)
+                self._released = True
+                return match.end()
+        return start
+
+    def _add_sentence(self, sentence: str, pieces: list[str]) -> None:
+        if not sentence:
+            return
+        if len(sentence) > self.max_chars:
+            self._release(pieces)
+            *full, sentence = textwrap.wrap(
+                sentence, width=self.max_chars, break_on_hyphens=False, tabsize=1
+            )
+            pieces.extend(full)
+            self._released = self._released or bool(full)
+        if self._current and len(self._current) + 1 + len(sentence) > self.max_chars:
+            self._release(pieces)
+        self._current = f"{self._current} {sentence}" if self._current else sentence
+        if len(self._current) >= (self.min_chars if self._released else self.first_chars):
+            self._release(pieces)
+
+    def _release(self, pieces: list[str]) -> None:
+        if self._current:
+            pieces.append(self._current)
+            self._current = ""
+            self._released = True
+
+
+def make_silence(pause_ms: float, sample_rate: int) -> np.ndarray:
     """``pause_ms`` of silence as a new float32 array (empty for a zero pause)."""
     if pause_ms < 0:
         raise ValueError("pause_ms must not be negative")
@@ -260,6 +366,25 @@ class XttsEngine:
         )
         return wav
 
+    def warm_up(self, text: str = "Hi.") -> float:
+        """Synthesize a tiny text and discard the audio; return the seconds it took.
+
+        The first synthesis after loading is about five times slower than the next ones
+        (kernel compilation and memory allocation), so call this in the background while the
+        user is still typing. It goes through the same lock as ``synthesize``. A failure is
+        logged as a warning and swallowed: warming up is only an optimisation, so this returns
+        0.0 instead of raising.
+        """
+        start = time.perf_counter()
+        try:
+            self.synthesize(text)
+        except Exception:
+            logger.warning("Warm-up synthesis failed", exc_info=True)
+            return 0.0
+        elapsed = time.perf_counter() - start
+        logger.info("Warm-up took %.1f s", elapsed)
+        return elapsed
+
     def synth_stream(
         self,
         text: str,
@@ -286,13 +411,13 @@ class XttsEngine:
         chunks = split_text(text, max_chars)
         if not chunks:
             raise ValueError("Nothing to synthesize: the text is empty")
-        _silence(pause_ms, self.sample_rate)  # reject a bad pause before any synthesis
+        make_silence(pause_ms, self.sample_rate)  # reject a bad pause before any synthesis
         logger.info("Synthesizing %d chunk(s)", len(chunks))
         for i, chunk in enumerate(chunks, 1):
             logger.debug("[chunk %d/%d] %s", i, len(chunks), chunk)
             yield self.synthesize(chunk)
             if i < len(chunks):
-                silence = _silence(pause_ms, self.sample_rate)
+                silence = make_silence(pause_ms, self.sample_rate)
                 if len(silence):
                     yield silence
 
