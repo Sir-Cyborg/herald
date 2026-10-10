@@ -1,0 +1,8 @@
+# Keep one line ending everywhere: a checkout on Windows must not turn the files into CRLF
+# (it breaks `ruff format --check`, shell snippets and byte-exact tests).
+* text=auto eol=lf
+
+# Never touch binary files.
+*.wav binary
+*.pth binary
+*.png binary

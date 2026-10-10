@@ -1,3 +1,5 @@
+# The unit tests replace the heavy libraries (torch, coqui-tts, Ollama) with fakes, so this runs
+# on Linux, Windows and macOS to check the portability of Herald's own code, not of torch/coqui.
 name: CI
 
 on:
@@ -9,7 +11,14 @@ permissions:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one OS failing must not hide the results of the others
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash # Git Bash on the Windows runners: the same syntax on all three systems
     steps:
       - uses: actions/checkout@v4
 
@@ -17,8 +26,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The unit tests replace everything heavy with fakes, so torch and coqui-tts (several GB)
-      # are not installed. Only what the tests import is: the pins come from pyproject.toml.
+      # torch and coqui-tts (several GB) are not installed. Only what the tests import is: the
+      # pins come from pyproject.toml.
       - name: Install herald without its heavy dependencies
         run: |
           pip install --no-deps -e .
@@ -40,7 +49,9 @@ jobs:
         run: pytest -m "not integration"
 
       # Cheap check that both Compose files (and their merge) are valid; nothing is built.
+      # Linux only: Docker is preinstalled there, not on the macOS runners.
       - name: Validate the Compose files
+        if: runner.os == 'Linux'
         run: |
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q

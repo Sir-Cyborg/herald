@@ -16,9 +16,9 @@ recording and downloads the base model (about 2 GB) by itself, once, the first t
 
 | You need | Details |
 | --- | --- |
-| A computer | A Mac with Apple Silicon is the tested setup. Linux and Windows should work too, ideally through [Docker](docs/docker.md), but have not been tried with the full stack |
+| A computer | A Mac with Apple Silicon is the tested setup. Windows and Linux should work, natively or through [Docker](docs/docker.md), but have not been tried with the full stack. If something fails, `herald doctor` tells you what |
 | Disk space | About 5 GB: the Python libraries, plus the base model |
-| Python 3.11 | Or Docker instead; see [docs/docker.md](docs/docker.md) |
+| Python 3.11 | 3.12 should work; 3.13 and newer are **not** supported yet. Or use Docker instead, see [docs/docker.md](docs/docker.md) |
 | **A recording of the voice** | 6 to 30 seconds of one person speaking: clear, no music, no echo. A WAV file is best. A phone voice memo of your own voice works |
 | Ollama | Only for `chat`. Install it from [ollama.com](https://ollama.com) |
 
@@ -26,27 +26,44 @@ recording and downloads the base model (about 2 GB) by itself, once, the first t
 
 ### 1. Install
 
+**macOS and Linux** (a terminal):
+
 ```bash
 git clone <this repository's URL> herald
 cd herald
 python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -e .
 ```
 
-Installing takes a few minutes. `herald` only exists inside that virtual environment, so run the
-`source` line again in every new terminal (if the shell says `command not found: herald`, that is
-why).
+**Windows** (PowerShell):
+
+```powershell
+git clone <this repository's URL> herald
+cd herald
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+Installing takes a few minutes. Notes:
+
+- `herald` only exists inside that virtual environment, so activate it again in every new
+  terminal. If the shell says `command not found: herald`, that is why. You can also skip the
+  activation and type the full path wherever this guide says `herald`: `.venv/bin/herald` on
+  macOS and Linux, `.venv\Scripts\herald` on Windows.
+- **Windows without Python 3.11?** `py -3.11` fails when it is not installed, and a newer Python
+  (3.13, 3.14) does not work with Herald. Install 3.11 from [python.org](https://www.python.org/downloads/windows/)
+  (tick "Add python.exe to PATH"), or run `winget install Python.Python.3.11`, then open a new window.
+- **PowerShell says "running scripts is disabled"?** Run
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` (it only affects that window) and
+  activate again, or use the full path above.
 
 ### 2. Make it speak
 
-Put your recording in the project folder. The `dataset/` folder is ignored by git, so a voice kept
-there never ends up on GitHub:
-
-```bash
-mkdir -p dataset/me
-cp ~/Downloads/my_voice.wav dataset/me/voice.wav
-```
+Put your recording in the project folder: create the folder `dataset/me` (it does not exist yet)
+and copy your file into it as `voice.wav`, with the file manager or the terminal. The `dataset/`
+folder is ignored by git, so a voice kept there never ends up on GitHub.
 
 Now say something with it:
 
@@ -84,9 +101,10 @@ Typing the recording, the language and the personality every time gets old. A **
 them in one small file:
 
 ```bash
-herald new-profile me --reference-wav dataset/me/voice.wav --language en \
-    --system-prompt "You are a calm assistant. Answer in one or two short sentences."
+herald new-profile me --reference-wav dataset/me/voice.wav --language en --system-prompt "You are a calm assistant. Answer in one or two short sentences."
+```
 
+```bash
 herald chat --profile me
 ```
 
@@ -122,9 +140,17 @@ is available.
 
 ## When something does not work
 
+First run **`herald doctor`**: it checks Python, the libraries, the voice files, Ollama and the
+audio player, and says what to fix. Include its output if you ask for help.
+
 | What you see | What to do |
 | --- | --- |
-| `command not found: herald` | Activate the environment: `source .venv/bin/activate` |
+| `command not found: herald`, or on Windows `'herald' is not recognized` | The environment is not active, or the install did not finish. Activate it (`source .venv/bin/activate`, on Windows `.venv\Scripts\Activate.ps1`) or call `.venv/bin/herald` (Windows: `.venv\Scripts\herald`) directly. If `pip install -e .` printed an error, look for it in the rows below |
+| `requires a different Python` (during `pip install`) | Herald supports Python 3.11 and 3.12. Install 3.11 next to your Python and create the environment with it (`python3.11 -m venv .venv`, on Windows `py -3.11 -m venv .venv`) |
+| Windows: `'py' is not recognized` | Install Python 3.11 from python.org and tick "Add python.exe to PATH", or run `winget install Python.Python.3.11`; then open a new window |
+| Windows PowerShell: `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` (only for that window), or skip the activation and use `.venv\Scripts\herald` |
+| Windows: `Microsoft Visual C++ 14.0 or greater is required` | A library had to be compiled. Install "Build Tools for Visual Studio", or use [Docker](docs/docker.md) |
+| Windows: errors about paths or file names being too long | Windows limits paths to 260 characters. Clone the project close to the drive root, for example `C:\herald` |
 | `No dataset found ... pass --reference-wav` | Give a recording: `--reference-wav path/to/voice.wav` |
 | `Cannot connect to Ollama` | Start the Ollama app (or run `ollama serve`) and check that the model is pulled |
 | No sound | Herald plays with `afplay` (macOS), `winsound` (Windows) or a common Linux player. Add `--save-dir some_folder` to keep the audio as files |

@@ -33,8 +33,7 @@ cp .env.example .env                                  # optional: read the comme
 mkdir -p dataset models runs output                   # otherwise Docker creates them as root
 docker compose build
 docker compose run --rm herald download-checkpoints   # base weights into ./models/xtts_v2
-docker compose run --rm herald synthesize "Hello." --reference-wav dataset/my_voice.wav \
-    -o output/hello.wav
+docker compose run --rm herald synthesize "Hello." --reference-wav dataset/my_voice.wav -o output/hello.wav
 docker compose run --rm herald chat --no-play          # text only; needs the ollama service (see below)
 ```
 
@@ -63,9 +62,11 @@ docker compose exec ollama ollama pull llama3.2:3b
   Mac, where containers get no GPU):
 
   ```bash
-  HERALD_OLLAMA_URL=http://host.docker.internal:11434 \
-    docker compose run --rm herald chat --no-play
+  HERALD_OLLAMA_URL=http://host.docker.internal:11434 docker compose run --rm herald chat --no-play
   ```
+
+  In Windows PowerShell set the variable first: `$env:HERALD_OLLAMA_URL = "http://host.docker.internal:11434"`,
+  then run `docker compose run --rm herald chat --no-play`. Or put the line in the `.env` file.
 
 - Ollama's port is not published, because a native Ollama usually owns 11434. Add
   `ports: ["11434:11434"]` to the `ollama` service to reach it from the host (it has no

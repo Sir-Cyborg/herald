@@ -1,6 +1,6 @@
 """Command line interface.
 
-``herald synthesize | train | slim | chat | tools | profiles | new-profile |
+``herald synthesize | train | slim | chat | tools | profiles | new-profile | doctor |
 download-checkpoints``.
 
 This module must stay cheap to import so that ``herald --help`` is instant: torch,
@@ -402,6 +402,14 @@ def build_parser(settings: Settings, pd: Mapping | None = None) -> argparse.Argu
     p.add_argument("--force", action="store_true", help="Replace the profile if it exists.")
     p.set_defaults(func=_cmd_new_profile)
 
+    # doctor
+    p = add(
+        "doctor",
+        "Check that this computer is ready to run Herald and say what is missing.",
+        parents=[_profile_parent(settings)],
+    )
+    p.set_defaults(func=_cmd_doctor)
+
     # download-checkpoints
     p = add(
         "download-checkpoints",
@@ -757,6 +765,12 @@ def _cmd_new_profile(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
+    from herald.doctor import run_doctor
+
+    return run_doctor(settings, args.profile)
+
+
 def _describe_parameters(schema: dict) -> list[str]:
     """``name (type, required): description`` for each parameter of a tool schema."""
     parameters = schema.get("function", {}).get("parameters", {})
@@ -878,7 +892,24 @@ def _use_profile(args: argparse.Namespace, profile, settings: Settings) -> bool:
     return not problems
 
 
+def _make_output_robust() -> None:
+    """Never let a character that the console cannot show crash the program.
+
+    On Windows the console, or a pipe, often has a narrow code page (cp1252, cp850): printing a
+    reply with an emoji would raise UnicodeEncodeError. With ``errors="replace"`` the character
+    comes out as ``?`` instead.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):  # a closed or unusual stream: leave it as it is
+                pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _make_output_robust()
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
         settings = Settings.from_env()

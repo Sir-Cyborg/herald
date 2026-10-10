@@ -14,6 +14,7 @@ Everything here is also available from the terminal: `herald --help` and `herald
 | `herald new-profile` | Create a voice profile |
 | `herald tools` | List the tools the assistant can use |
 | `herald download-checkpoints` | Fetch the base XTTS-v2 weights (about 2 GB) |
+| `herald doctor` | Check that this computer is ready for Herald and say what is missing |
 
 ## Synthesize
 
@@ -36,8 +37,11 @@ XTTS-v2 handles well for English, and joined with 150 ms of silence (`--max-char
 
 ```bash
 herald synthesize "Hello." --checkpoint models/frieren
-export HERALD_CHECKPOINT=models/frieren       # then `synthesize` and `chat` use it by default
 ```
+
+To make a voice the default instead of typing `--checkpoint` every time, use a
+[profile](#profiles), or set the variable `HERALD_CHECKPOINT=models/frieren` (macOS and Linux:
+`export HERALD_CHECKPOINT=models/frieren`; Windows PowerShell: `$env:HERALD_CHECKPOINT = "models/frieren"`).
 
 A fine-tuned voice only needs the small `config.json` and `vocab.json` of the base model, so
 its first run downloads a few hundred KB, not 2 GB. Unset `HERALD_CHECKPOINT` to use the base
@@ -121,8 +125,7 @@ the accent can lean towards the training language, and the more the fine-tuning 
 towards one language the more the others can suffer. It is worth listening for yourself:
 
 ```bash
-herald synthesize "Sono passati molti anni da quando ho lasciato il mio villaggio." \
-    --language it --checkpoint models/frieren -o output/prova_it.wav --play
+herald synthesize "Sono passati molti anni da quando ho lasciato il mio villaggio." --language it --checkpoint models/frieren -o output/prova_it.wav --play
 ```
 
 For the best result in a language, fine-tune on recordings **in that language** of the same

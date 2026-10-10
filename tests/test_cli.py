@@ -53,6 +53,7 @@ COMMANDS = [
     "tools",
     "profiles",
     "new-profile",
+    "doctor",
     "download-checkpoints",
 ]
 
@@ -177,6 +178,61 @@ def test_help_shows_environment_defaults(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         cli.main(["synthesize", "--help"])
     assert "(default: it)" in capsys.readouterr().out
+
+
+class TestOutputThatCannotShowEverything:
+    """On Windows the console or a pipe can have a narrow code page: a reply with an emoji must
+    come out as ``?``, not crash the chat with UnicodeEncodeError."""
+
+    def narrow(self, encoding):
+        return io.TextIOWrapper(io.BytesIO(), encoding=encoding, write_through=True)
+
+    @pytest.mark.parametrize("encoding", ["ascii", "cp1252", "cp850"])
+    def test_main_makes_printing_safe(self, encoding, monkeypatch):
+        out, err = self.narrow(encoding), self.narrow(encoding)
+        # Without it, printing the character fails: this is what the fix is for.
+        with pytest.raises(UnicodeEncodeError):
+            print("\U0001f600", file=self.narrow(encoding))
+
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys, "stderr", err)
+        with pytest.raises(SystemExit):
+            cli.main(["--version"])
+        print("Herald: \U0001f600 done", file=sys.stdout)
+        print("error: \U0001f600", file=sys.stderr)
+        assert out.buffer.getvalue().endswith(b"Herald: ? done\n")
+        assert err.buffer.getvalue() == b"error: ?\n"
+
+    def test_text_the_console_can_show_is_untouched(self, monkeypatch):
+        out = self.narrow("cp1252")
+        monkeypatch.setattr(sys, "stdout", out)
+        cli._make_output_robust()
+        print("caf\u00e9", file=sys.stdout)
+        assert out.buffer.getvalue() == "caf\u00e9\n".encode("cp1252")
+
+    def test_it_happens_before_anything_else_so_even_errors_are_safe(self, monkeypatch):
+        err = self.narrow("ascii")
+        monkeypatch.setattr(sys, "stderr", err)
+        monkeypatch.setenv("HERALD_OLLAMA_TIMEOUT", "soon")  # fine until chat needs it
+        code = cli.main(["new-profile", "bad name \u00e9\U0001f600"])
+        assert code == 1
+        assert b"Invalid profile name" in err.buffer.getvalue()
+
+    def test_streams_that_cannot_be_reconfigured_are_left_alone(self, monkeypatch):
+        class Plain:  # no reconfigure at all
+            def write(self, text):
+                return len(text)
+
+            def flush(self):
+                pass
+
+        class Stubborn(Plain):
+            def reconfigure(self, **kwargs):
+                raise ValueError("cannot change the encoding after reading")
+
+        monkeypatch.setattr(sys, "stdout", Plain())
+        monkeypatch.setattr(sys, "stderr", Stubborn())
+        cli._make_output_robust()  # must not raise
 
 
 def test_version(capsys):

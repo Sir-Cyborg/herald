@@ -620,7 +620,10 @@ class TestRelativeToRoot:
 
     def test_a_symlinked_root(self, root, tmp_path):
         link = tmp_path / "link"
-        link.symlink_to(root, target_is_directory=True)
+        try:
+            link.symlink_to(root, target_is_directory=True)
+        except OSError as exc:  # Windows without developer mode or admin rights
+            pytest.skip(f"cannot create symlinks here: {exc}")
         (root / "models").mkdir()
         assert relative_to_root(root / "models", link) == "models"
         assert relative_to_root(link / "models", root) == "models"
